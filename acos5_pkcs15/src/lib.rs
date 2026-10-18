@@ -1215,6 +1215,16 @@ extern "C" fn acos5_pkcs15_generate_key(profile_ptr: *mut sc_profile,
             rv = me_pkcs15_dup_bignum(&mut p15pubkey.u.rsa.exponent, &(*p15pubkey2_ptr).u.rsa.exponent);
             if rv != SC_SUCCESS { return rv; }
         }
+        else {
+            /* EC: the curve parameters were already set by sc_pkcs15init_generate_key; hand over the
+               (uncompressed) point read from the card, taking ownership of its buffer */
+            let q = &mut (*p15pubkey2_ptr).u.ec.ecpointQ;
+            if !p15pubkey.u.ec.ecpointQ.value.is_null() { free(p15pubkey.u.ec.ecpointQ.value.cast::<c_void>()); }
+            p15pubkey.u.ec.ecpointQ.value = q.value;
+            p15pubkey.u.ec.ecpointQ.len = q.len;
+            q.value = null_mut();
+            q.len = 0;
+        }
         sc_pkcs15_free_pubkey(p15pubkey2_ptr);
     }
 
@@ -1311,12 +1321,13 @@ extern "C" fn acos5_pkcs15_emu_store_data(p15card: *mut sc_pkcs15_card, profile:
         log3if!(ctx,f,line!(), c"path: %s", unsafe { sc_dump_hex((*path).value.as_ptr(), (*path).len) }); // 0
     }
 
-    if SC_PKCS15_TYPE_PRKEY_RSA == object.type_ {
+    if [SC_PKCS15_TYPE_PRKEY_RSA, SC_PKCS15_TYPE_PRKEY_EC].contains(&object.type_) {
         let mut dp = unsafe { Box::from_raw(card.drv_data.cast::<DataPrivate>()) };
         dp.last_keygen_priv_id = unsafe { (*object.data.cast::<sc_pkcs15_prkey_info>() ).id };
         card.drv_data = Box::into_raw(dp).cast::<c_void>();
     }
-    else if SC_PKCS15_TYPE_PUBKEY_RSA == object.type_ {
+    /* EC public keys get a path too (the driver tracks key files by it); read_public_key returns an SPKI */
+    else if [SC_PKCS15_TYPE_PUBKEY_RSA, SC_PKCS15_TYPE_PUBKEY_EC].contains(&object.type_) {
         let key_info = unsafe { &mut *object.data.cast::<sc_pkcs15_pubkey_info>() };
 /*
     log3if!(ctx,f,line!(), c"object.label: %s",   object.label.as_ptr()); // pkcs15-init -G rsa/3072 -a 01 -i 08 -l testkey -u sign,decrypt
@@ -1349,7 +1360,9 @@ extern "C" fn acos5_pkcs15_emu_store_data(p15card: *mut sc_pkcs15_card, profile:
         }
     }
 */
-        key_info.modulus_length = rsa_modulus_bits_canonical(key_info.modulus_length);
+        if SC_PKCS15_TYPE_PUBKEY_RSA == object.type_ {
+            key_info.modulus_length = rsa_modulus_bits_canonical(key_info.modulus_length);
+        }
         key_info.access_flags = SC_PKCS15_PRKEY_ACCESS_EXTRACTABLE | SC_PKCS15_PRKEY_ACCESS_LOCAL;
         key_info.native = 1;
         let dp = unsafe { Box::from_raw(card.drv_data.cast::<DataPrivate>()) };

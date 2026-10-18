@@ -89,7 +89,7 @@ use opensc_sys::asn1::{sc_asn1_read_tag, SC_ASN1_TAG_EOC};
 
 use crate::constants_types::{DataPrivate, FDB_RSA_KEY_EF, FDB_SE_FILE, FDB_SYMMETRIC_KEY_EF, SACinfo, SAEinfo, Tlv,
                              is_DFMF, FDB_ECC_KEY_EF, UPDATE, CRYPTO, DELETE_SELF, CREATE_EF, CREATE_DF,
-                             file_id_from_path_value, safe_int_try_from};
+                             file_id_from_path_value, safe_int_try_from, SC_CARD_TYPE_ACOS5_EVO_V4};
 use crate::path::current_path_df;
 
 /*
@@ -428,7 +428,8 @@ pub(crate) fn se_get_is_scb_suitable_for_sm_has_ct(card: &mut sc_card, file_id: 
                     for crt in &sac_info.crts[0..sac_info.crts_len] {
                         if crt.tag   != search_template_CCT.tag   { continue; }
                         if (crt.usage & search_template_CCT.usage) != search_template_CCT.usage { continue; }
-                        if crt.algo  != 0x02   { continue; }
+                        /* V2/V3: 3DES CBC (02); EVO: AES CMAC (1D) */
+                        if crt.algo  != 0x02 && !(card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 && crt.algo == 0x1D) { continue; }
                         if ![0x84_u8, 0x81, 0x82, 0x83, 1,2,3].contains(&(safe_int_try_from::<u32,u8>(crt.refs[0]))) { continue; }
                         CCT_found = true;
                         break;
@@ -441,7 +442,8 @@ pub(crate) fn se_get_is_scb_suitable_for_sm_has_ct(card: &mut sc_card, file_id: 
                     for crt in &sac_info.crts[0..sac_info.crts_len] {
                         if crt.tag   != search_template_CT.tag   { continue; }
                         if (crt.usage & search_template_CT.usage) != search_template_CT.usage   { continue; }
-                        if crt.algo  != 0x02   { continue; }
+                        /* V2/V3: 3DES CBC (02); EVO: AES CBC (15) */
+                        if crt.algo  != 0x02 && !(card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 && crt.algo == 0x15) { continue; }
                         if ![0x84_u8, 0x81, 0x82, 0x83, 1,2,3].contains(&(safe_int_try_from::<u32,u8>(crt.refs[0]))) { continue; }
                         CT_found = true;
                         break;

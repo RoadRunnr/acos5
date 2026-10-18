@@ -410,7 +410,7 @@ use opensc_sys::opensc::{SC_SEC_OPERATION_ENCRYPT_SYM, SC_SEC_OPERATION_DECRYPT_
 //use opensc_sys::opensc::{SC_ALGORITHM_RSA_PAD_PSS};
 use opensc_sys::opensc::{sc_update_record, SC_SEC_ENV_PARAM_IV, SC_SEC_ENV_PARAM_TARGET_FILE,
                          SC_ALGORITHM_AES_CBC, SC_ALGORITHM_AES_ECB, SC_SEC_OPERATION_UNWRAP,
-                         SC_ALGORITHM_AES_CBC_PAD, sc_ec_parameters//, SC_CARD_CAP_UNWRAP_KEY, SC_CARD_CAP_ONCARD_SESSION_OBJECTS, SC_CARD_CAP_WRAP_KEY
+                         SC_ALGORITHM_AES_CBC_PAD//, SC_CARD_CAP_UNWRAP_KEY, SC_CARD_CAP_ONCARD_SESSION_OBJECTS, SC_CARD_CAP_WRAP_KEY
 //                         , SC_SEC_OPERATION_WRAP
 };
 
@@ -418,10 +418,10 @@ use opensc_sys::types::{SC_AC_CHV, sc_aid, sc_path, sc_file, sc_serial_number, S
                         SC_PATH_TYPE_FILE_ID, SC_PATH_TYPE_DF_NAME, SC_PATH_TYPE_PATH, SC_FILE_TYPE_DF,
                         SC_FILE_TYPE_INTERNAL_EF, SC_FILE_EF_TRANSPARENT, SC_APDU_FLAGS_CHAINING,
                         SC_APDU_FLAGS_NO_GET_RESP, SC_APDU_CASE_1, SC_APDU_CASE_2_SHORT,
-                        SC_APDU_CASE_3_SHORT, SC_APDU_CASE_4_SHORT, sc_object_id, sc_lv_data, SC_APDU_CASE_2_EXT};
+                        SC_APDU_CASE_3_SHORT, SC_APDU_CASE_4_SHORT};
 #[cfg(any(target_os = "windows", not(any(v0_20_0, v0_21_0, v0_22_0, v0_23_0, v0_24_0, v0_25_0, v0_25_1, v0_26_0, v0_26_1))))]
 use opensc_sys::types::SC_MAX_AID_SIZE;
-use opensc_sys::errors::{SC_SUCCESS/*, SC_ERROR_INTERNAL*/, SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_KEYPAD_MSG_TOO_LONG,
+use opensc_sys::errors::{SC_ERROR_OUT_OF_MEMORY, SC_ERROR_UNKNOWN_DATA_RECEIVED, SC_SUCCESS/*, SC_ERROR_INTERNAL*/, SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_KEYPAD_MSG_TOO_LONG,
                          SC_ERROR_NO_CARD_SUPPORT, SC_ERROR_INCOMPATIBLE_KEY, SC_ERROR_WRONG_CARD, SC_ERROR_WRONG_PADDING,
                          SC_ERROR_INCORRECT_PARAMETERS, SC_ERROR_NOT_SUPPORTED, SC_ERROR_BUFFER_TOO_SMALL, SC_ERROR_NOT_ALLOWED,
                          SC_ERROR_SECURITY_STATUS_NOT_SATISFIED, SC_ERROR_CARD_CMD_FAILED, SC_ERROR_FILE_ALREADY_EXISTS,
@@ -437,7 +437,7 @@ use opensc_sys::iso7816::{ISO7816_TAG_FCP_TYPE, ISO7816_TAG_FCP_LCS,  ISO7816_TA
                           ISO7816_TAG_FCP_FID, ISO7816_TAG_FCP_DF_NAME};
 use opensc_sys::pkcs15::{sc_pkcs15_pubkey_rsa, sc_pkcs15_bignum, sc_pkcs15_encode_pubkey_rsa, sc_pkcs15_bind,
                          sc_pkcs15_unbind, sc_pkcs15_auth_info, sc_pkcs15_get_objects, SC_PKCS15_TYPE_AUTH_PIN,
-                         sc_pkcs15_id, sc_pkcs15_pubkey_ec, sc_pkcs15_u8, sc_pkcs15_encode_pubkey_ec
+                         sc_pkcs15_id
                          /*,sc_pkcs15_object, sc_pkcs15_card*/}; // , SC_PKCS15_AODF
 use opensc_sys::sm::{SM_TYPE_CWA14890, SM_CMD_PIN, SM_CMD_PIN_VERIFY, SM_CMD_PIN_SET_PIN, SM_CMD_PIN_RESET,
                      SM_CMD_FILE_UPDATE, SM_CMD_FILE_DELETE};
@@ -499,6 +499,7 @@ use constants_types::{BLOCKCIPHER_PAD_TYPE_ANSIX9_23, BLOCKCIPHER_PAD_TYPE_ONEAN
 use constants_types::{ui_context, set_ui_ctx, get_ui_ctx, acos5_ask_user_consent};
 
 mod crypto;
+use crypto::{ec_point_uncompress, ec_spki_der};
 
 /// There are some functions implemented in `OpenSC` and available from a static libopensc.a library
 /// (typically not made available by distribution packages),
@@ -3156,14 +3157,21 @@ fn acos5_read_public_key(card: &mut sc_card, ctx: &mut sc_context,
             let mut flags : c_ulong = 0;
             if (card.caps & SC_CARD_CAP_APDU_EXT) == 0 { sc_read_binary(card, 0, rbuf.as_mut_ptr(), le_total, &raw mut flags) }
             else {
-                let mut apdu = build_apdu(ctx, &[0x80, 0xCA, 0, 0, 0,
-                    safe_int_try_from((RSAPUB_MAX_LEN>>8) & 0xFF),
-                    safe_int_try_from((RSAPUB_MAX_LEN   ) & 0xFF)],
-                    SC_APDU_CASE_2_EXT, &mut rbuf);
-                let mut r = safe_sc_transmit_apdu(card, &mut apdu);  if r != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), r)); }
-                r = safe_sc_check_sw(card, &apdu);
-                if r != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), r)); }
-                safe_int_try_from::<usize,i32>(apdu.resplen)
+                /* ACOS5-EVO rejects an extended Le for Get Key (67 00): read in short chunks of max. 0xFF bytes,
+                   P1 P2 = offset */
+                let mut off = 0_usize;
+                while off < le_total {
+                    let le = min(0xFF, le_total - off);
+                    let [hi, lo] = safe_int_try_from::<usize,u16>(off).to_be_bytes();
+                    let mut apdu = build_apdu(ctx, &[0x80, 0xCA, hi, lo, safe_int_try_from(le)],
+                        SC_APDU_CASE_2_SHORT, &mut rbuf[off..off+le]);
+                    let mut r = safe_sc_transmit_apdu(card, &mut apdu);  if r != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), r)); }
+                    r = safe_sc_check_sw(card, &apdu);
+                    if r != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), r)); }
+                    if apdu.resplen == 0 { break; }
+                    off += apdu.resplen;
+                }
+                safe_int_try_from::<usize,i32>(off)
             }
         }
     }};
@@ -3263,14 +3271,16 @@ fn acos5_read_public_key_ec(card: &mut sc_card,
         return SC_ERROR_INCOMPATIBLE_KEY;
     }
     let curve_indicator = rbuf[1];
-//    let point_format_indicator = rbuf[5];
-    let point_length_readable /* starting from position 5, not 6 !!! */ = match curve_indicator {
-        1 => 28_u8+1,
-        2 => 32+1,
-        3 => 48+1,
-        4 => 66+1,
+    let point_format_indicator = rbuf[5]; // 02/03: compressed, 04: uncompressed (EVO uses both, e.g. P-224: 04)
+    let coord_len = match curve_indicator {
+        1 => 28_u8,
+        2 => 32,
+        3 => 48,
+        4 => 66,
         _ => 0,
     };
+    let point_length_readable /* starting from position 5, not 6 !!! */ =
+        if point_format_indicator == 4 { 1 + 2*coord_len } else { 1 + coord_len };
     // SAFETY:
     rv = unsafe { cfg_select! {
         any(v0_20_0, v0_21_0, v0_22_0, v0_23_0) => {
@@ -3287,21 +3297,27 @@ fn acos5_read_public_key_ec(card: &mut sc_card,
         return rv;
     }
 
-    let mut ec_key = sc_pkcs15_pubkey_ec {
-        params: sc_ec_parameters { named_curve: c"nistp521".as_ptr().cast_mut(), id: sc_object_id { value : [1, 3, 132, 0, 35,  -1,0,0,0,0,0,0,0,0,0,0] },
-                                   der: sc_lv_data::default(), type_: 1, field_length: 521,
-                    #[cfg(not(any(v0_20_0, v0_21_0, v0_22_0, v0_23_0, v0_24_0, v0_25_0, v0_25_1, v0_26_0, v0_26_1)))]
-                    key_type : 0
-                },
-        ecpointQ: sc_pkcs15_u8 { value: rbuf.as_mut_ptr(), len: point_length_readable.into() }
+    /* EVO stores compressed points; OpenSC needs an uncompressed one */
+    let uncompressed = if [2_u8, 3].contains(&rbuf[0]) {
+        match ec_point_uncompress(curve_indicator, &rbuf[..usize::from(point_length_readable)]) {
+            Some(v) => v,
+            None => {
+                log3if!(ctx,f,line!(), c"### failed: EC public key point is not on the curve ###");
+                return SC_ERROR_INCOMPATIBLE_KEY;
+            }
+        }
+    } else { rbuf[..usize::from(point_length_readable)].to_vec() };
+
+    /* hand OpenSC an SPKI: unlike a bare ECPoint it carries the curve (needed for CKA_EC_PARAMS) */
+    let Some(spki) = ec_spki_der(curve_indicator, &uncompressed) else {
+        return log3ifr_ret!(ctx,f,line!(), SC_ERROR_INCOMPATIBLE_KEY);
     };
-
-    /* transform the raw content to der-encoded */
-    // SAFETY:
-    rv = unsafe { sc_pkcs15_encode_pubkey_ec(ctx, &raw mut ec_key, out, out_len) };
-
-    if rv < 0 {
-        return log3ifr_ret!(ctx,f,line!(), c"Error: sc_pkcs15_encode_pubkey_ec failed: returning with", rv);
+    let buf = unsafe { libc::malloc(spki.len()).cast::<u8>() };
+    if buf.is_null() { return log3ifr_ret!(ctx,f,line!(), SC_ERROR_OUT_OF_MEMORY); }
+    unsafe {
+        copy_nonoverlapping(spki.as_ptr(), buf, spki.len());
+        *out = buf;
+        *out_len = spki.len();
     }
     SC_SUCCESS
 }
@@ -3393,18 +3409,18 @@ Tokenunfo
             //rv = SC_ERROR_KEYPAD_MSG_TOO_LONG;
             return Err(log3ifr_ret!(ctx,f,line!(), c"Error: 'Set Security Environment for Sign' failed-Returning with", rv));
         }
-        /* sign may need decrypt (for non-SHA1/SHA256 hashes), thus prepare for a CT as well */
-        algo = algo_ref_mse_sedo(card.type_, 0, CRT_TAG_CT,
-            env_ref.algorithm, 0, false, false)?;
-        command = [0x00, 0x22, 0x01, CRT_TAG_CT, 0x0A, 0x80, 0x01, algo, 0x81, 0x02,
-            env_ref.file_ref.value[path_idx], env_ref.file_ref.value[path_idx+1],  0x95, 0x01, 0x40];
-        let mut apdu = build_apdu(ctx, &command, SC_APDU_CASE_3_SHORT, &mut[]);
-        rv = safe_sc_transmit_apdu(card, &mut apdu); if rv != SC_SUCCESS { return Err(rv); }
-        rv = safe_sc_check_sw(card, &apdu);
-//println!("rv: {}, apdu: {:?}", rv, apdu);
-        if rv != SC_SUCCESS {
-            //rv = SC_ERROR_KEYPAD_MSG_TOO_LONG;
-            return Err(log3ifr_ret!(ctx,f,line!(), c"Error: 'Set Security Environment for Decrypt' failed. Returning with", rv));
+        /* RSA sign may need decrypt (for non-SHA1/SHA256 hashes), thus prepare for a CT as well; not for ECDSA */
+        if env_ref.algorithm == SC_ALGORITHM_RSA {
+            algo = algo_ref_mse_sedo(card.type_, 0, CRT_TAG_CT,
+                env_ref.algorithm, 0, false, false)?;
+            command = [0x00, 0x22, 0x01, CRT_TAG_CT, 0x0A, 0x80, 0x01, algo, 0x81, 0x02,
+                env_ref.file_ref.value[path_idx], env_ref.file_ref.value[path_idx+1],  0x95, 0x01, 0x40];
+            let mut apdu = build_apdu(ctx, &command, SC_APDU_CASE_3_SHORT, &mut[]);
+            rv = safe_sc_transmit_apdu(card, &mut apdu); if rv != SC_SUCCESS { return Err(rv); }
+            rv = safe_sc_check_sw(card, &apdu);
+            if rv != SC_SUCCESS {
+                return Err(log3ifr_ret!(ctx,f,line!(), c"Error: 'Set Security Environment for Decrypt' failed. Returning with", rv));
+            }
         }
     }
 
@@ -3782,6 +3798,24 @@ fn acos5_compute_signature(card: &mut sc_card, ctx: &mut sc_context, data: &[u8]
     log3ift!(ctx,f,line!(), c"called with: in_len: %zu, out_len: %zu", data.len(), out.len());
     set_is_running_compute_signature(card, false); // this is an info valuable only when delegating to acos5_decipher
 
+    /* ECDSA (EVO): OpenSC passes the raw hash (SC_ALGORITHM_ECDSA_RAW); the card returns r || s */
+    if get_sec_env(card).algorithm == SC_ALGORITHM_EC {
+        if data.is_empty() || data.len() > 66 { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_INVALID_ARGUMENTS)); }
+        let mut cmd = vec![0, 0x2A, 0x9E, 0x9A, u8::try_from(data.len()).unwrap_or(0)];
+        cmd.extend_from_slice(data);
+        cmd.push(0);
+        let mut rbuf = [0_u8; 2 * 66];
+        let mut apdu = build_apdu(ctx, &cmd, SC_APDU_CASE_4_SHORT, &mut rbuf);
+        let mut r = safe_sc_transmit_apdu(card, &mut apdu);  if r != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), r)); }
+        r = safe_sc_check_sw(card, &apdu);
+        if r != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), r)); }
+        if apdu.resplen > out.len() || apdu.resplen == 0 || !apdu.resplen.is_multiple_of(2) {
+            return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_UNKNOWN_DATA_RECEIVED));
+        }
+        out[..apdu.resplen].copy_from_slice(&rbuf[..apdu.resplen]);
+        return Ok(log3ifr_ret!(ctx,f,line!(), safe_int_try_from::<usize,i32>(apdu.resplen)));
+    }
+
     let mut rv; //= SC_SUCCESS;
     //   sha1     sha256  +md2/5 +sha1  +sha224  +sha256  +sha384  +sha512
     if ![20_usize, 32,     34,    35,    47,      51,      67,      83, get_sec_env_mod_len(card)].contains(&data.len()) {
@@ -4038,7 +4072,7 @@ extern "C" fn compute_signature(card_ptr: *mut sc_card, data_ref_ptr: *const u8,
     }
     // SAFETY: dereferencing a non-null pointer, received from extern "C" fn
     if card_ptr.is_null() || unsafe { (*card_ptr).ctx.is_null() } || data_ref_ptr.is_null() || out_ptr.is_null() ||
-        outlen < 64 { // cos5 supports RSA beginning from moduli 512 bits = 64 bytes
+        outlen < 56 { // RSA from 512 bit moduli = 64 bytes; ECDSA P-224 (EVO) = 56 bytes
         return SC_ERROR_INVALID_ARGUMENTS;
     }
     assert!(data_len <= outlen);

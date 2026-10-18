@@ -25,15 +25,13 @@
 #![allow(clippy::upper_case_acronyms, reason = "..")]
 
 use std::os::raw::c_long;
-#[cfg(test)]
 use std::os::raw::c_int;
 
 use crate::constants_types::safe_int_try_from;
 
 pub(crate) const DES_KEY_SZ_u8 : u8    = 8; // sizeof(DES_cblock)
 pub(crate) const DES_KEY_SZ    : usize = 8; // sizeof(DES_cblock)
-#[cfg(test)]
-const AES_BLOCK_SIZE: usize = 16;
+pub(crate) const AES_BLOCK_SIZE: usize = 16;
 
 pub(crate) const Encrypt: i32 = 1;
 pub(crate) const Decrypt: i32 = 0;
@@ -56,7 +54,6 @@ struct DES_key_schedule {
     ks: [DES_cblock; 16],
 }
 
-#[cfg(test)]
 #[repr(C)]
 #[derive(/*Default,*/ Debug)]
 struct AES_KEY {
@@ -64,7 +61,6 @@ struct AES_KEY {
     rounds: c_int,
 }
 
-#[cfg(test)]
 impl Default for AES_KEY {
     fn default() -> Self {
         Self {
@@ -115,19 +111,15 @@ unsafe extern "C" {
 
     /// <https://mta.openssl.org/pipermail/openssl-users/2021-August/014103.html>
     //#[expect(dead_code, reason = "..")]
-    #[cfg(test)]
     fn AES_set_encrypt_key(userKey: *const u8, bits: i32, key: *mut AES_KEY) -> i32;
     //#[expect(dead_code, reason = "..")]
-    #[cfg(test)]
     fn AES_set_decrypt_key(userKey: *const u8, bits: i32, key: *mut AES_KEY) -> i32;
 
     /// <https://docs.openssl.org/3.1/man7/migration_guide>
     //#[expect(dead_code, reason = "..")]
-    #[cfg(test)]
     fn AES_ecb_encrypt(in_: *const u8, out: *mut u8, key: *const AES_KEY, enc: i32);
     /// <https://docs.openssl.org/3.1/man7/migration_guide>
     //#[expect(dead_code, reason = "..")]
-    #[cfg(test)]
     fn AES_cbc_encrypt(in_: *const u8, out: *mut u8, length: usize, key: *const AES_KEY, ivec: *mut u8, enc: i32);
 }
 
@@ -480,5 +472,208 @@ mod tests {
         assert_eq!(&[0xBF, 0x59, 0xFF, 0x28, 0xE3, 0x23, 0xB9, 0xF4][..], e.as_slice());
 */
 //println!("{:X?}", e);
+    }
+}
+
+/* ACOS5-EVO secure messaging: AES with 128/192/256 bit keys.
+   Data must already be a multiple of AES_BLOCK_SIZE (callers apply the 0x80 padding). */
+#[must_use]
+pub(crate) fn aes_cbc_nopad(data: &[u8], key: &[u8], iv: &[u8; AES_BLOCK_SIZE], mode: i32) -> Vec<u8> {
+    assert!(data.len().is_multiple_of(AES_BLOCK_SIZE));
+    assert!([16, 24, 32].contains(&key.len()));
+    let mut aes_key = AES_KEY::default();
+    let mut ivec = *iv;
+    let mut output = vec![0_u8; data.len()];
+    let bits = 8 * i32::try_from(key.len()).unwrap_or(0);
+    unsafe {
+        let res = if mode == Encrypt { AES_set_encrypt_key(key.as_ptr(), bits, &raw mut aes_key) }
+                  else               { AES_set_decrypt_key(key.as_ptr(), bits, &raw mut aes_key) };
+        assert_eq!(0, res);
+        AES_cbc_encrypt(data.as_ptr(), output.as_mut_ptr(), data.len(), &raw const aes_key, ivec.as_mut_ptr(), mode);
+    }
+    output
+}
+
+/* Shift a 16 byte block left by one bit, then xor Rb (0x87) into the last byte if the msb was set. */
+fn cmac_subkey_double(block: &[u8; AES_BLOCK_SIZE]) -> [u8; AES_BLOCK_SIZE] {
+    let mut out = [0_u8; AES_BLOCK_SIZE];
+    for i in 0..AES_BLOCK_SIZE {
+        out[i] = block[i] << 1 | if i + 1 < AES_BLOCK_SIZE { block[i + 1] >> 7 } else { 0 };
+    }
+    if block[0] & 0x80 != 0 { out[AES_BLOCK_SIZE - 1] ^= 0x87; }
+    out
+}
+
+/* AES-CMAC (NIST SP 800-38B), full 16 byte tag */
+#[must_use]
+pub(crate) fn aes_cmac(data: &[u8], key: &[u8]) -> [u8; AES_BLOCK_SIZE] {
+    assert!([16, 24, 32].contains(&key.len()));
+    let mut aes_key = AES_KEY::default();
+    let bits = 8 * i32::try_from(key.len()).unwrap_or(0);
+    let mut l = [0_u8; AES_BLOCK_SIZE];
+    unsafe {
+        assert_eq!(0, AES_set_encrypt_key(key.as_ptr(), bits, &raw mut aes_key));
+        AES_ecb_encrypt([0_u8; AES_BLOCK_SIZE].as_ptr(), l.as_mut_ptr(), &raw const aes_key, Encrypt);
+    }
+    let k1 = cmac_subkey_double(&l);
+    let k2 = cmac_subkey_double(&k1);
+
+    let complete = !data.is_empty() && data.len().is_multiple_of(AES_BLOCK_SIZE);
+    let mut msg = data.to_vec();
+    if !complete {
+        msg.push(0x80);
+        while !msg.len().is_multiple_of(AES_BLOCK_SIZE) { msg.push(0); }
+    }
+    let n = msg.len() / AES_BLOCK_SIZE;
+    let subkey = if complete { k1 } else { k2 };
+    for (i, b) in msg[(n - 1) * AES_BLOCK_SIZE..].iter_mut().enumerate() { *b ^= subkey[i]; }
+
+    let mut x = [0_u8; AES_BLOCK_SIZE];
+    for chunk in msg.chunks_exact(AES_BLOCK_SIZE) {
+        let mut y = [0_u8; AES_BLOCK_SIZE];
+        for i in 0..AES_BLOCK_SIZE { y[i] = x[i] ^ chunk[i]; }
+        unsafe { AES_ecb_encrypt(y.as_ptr(), x.as_mut_ptr(), &raw const aes_key, Encrypt); }
+    }
+    x
+}
+
+#[cfg(test)]
+mod tests_evo_aes {
+    use super::{aes_cbc_nopad, aes_cmac, Encrypt, Decrypt};
+
+    fn hex(s: &str) -> Vec<u8> {
+        s.split_whitespace().map(|b| u8::from_str_radix(b, 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn cmac_sp800_38b_aes192() {
+        // NIST SP 800-38B, D.2 (AES-192)
+        let key = hex("8e 73 b0 f7 da 0e 64 52 c8 10 f3 2b 80 90 79 e5 62 f8 ea d2 52 2c 6b 7b");
+        assert_eq!(aes_cmac(&[], &key).to_vec(), hex("d1 7d df 46 ad aa cd e5 31 ca c4 83 de 7a 93 67"));
+        let m = hex("6b c1 be e2 2e 40 9f 96 e9 3d 7e 11 73 93 17 2a");
+        assert_eq!(aes_cmac(&m, &key).to_vec(), hex("9e 99 a7 bf 31 e7 10 90 06 62 f6 5e 61 7c 51 84"));
+        let m40 = hex("6b c1 be e2 2e 40 9f 96 e9 3d 7e 11 73 93 17 2a ae 2d 8a 57 1e 03 ac 9c 9e b7 6f ac 45 af 8e 51 30 c8 1c 46 a3 5c e4 11");
+        assert_eq!(aes_cmac(&m40, &key).to_vec(), hex("8a 1d e5 be 2e b3 1a ad 08 9a 82 e6 ee 90 8b 0e"));
+    }
+
+    #[test]
+    fn cbc_roundtrip() {
+        let key = [7_u8; 24];
+        let iv = [9_u8; 16];
+        let data = [0x5A_u8; 32];
+        let enc = aes_cbc_nopad(&data, &key, &iv, Encrypt);
+        assert_ne!(enc.as_slice(), data.as_slice());
+        assert_eq!(aes_cbc_nopad(&enc, &key, &iv, Decrypt).as_slice(), data.as_slice());
+    }
+}
+
+#[repr(C)] struct EC_GROUP { _p: [u8; 0] }
+#[repr(C)] struct EC_POINT { _p: [u8; 0] }
+#[repr(C)] struct BN_CTX   { _p: [u8; 0] }
+
+unsafe extern "C" {
+    fn EC_GROUP_new_by_curve_name(nid: c_int) -> *mut EC_GROUP;
+    fn EC_GROUP_free(group: *mut EC_GROUP);
+    fn EC_POINT_new(group: *const EC_GROUP) -> *mut EC_POINT;
+    fn EC_POINT_free(point: *mut EC_POINT);
+    fn EC_POINT_oct2point(group: *const EC_GROUP, p: *mut EC_POINT, buf: *const u8, len: usize, ctx: *mut BN_CTX) -> c_int;
+    fn EC_POINT_point2oct(group: *const EC_GROUP, p: *const EC_POINT, form: c_int, buf: *mut u8, len: usize, ctx: *mut BN_CTX) -> usize;
+    fn BN_CTX_new() -> *mut BN_CTX;
+    fn BN_CTX_free(ctx: *mut BN_CTX);
+}
+
+/* ACOS5-EVO curve indicator (1..4: P-224, P-256, P-384, P-521) -> OpenSSL NID */
+fn evo_curve_nid(curve_indicator: u8) -> Option<c_int> {
+    match curve_indicator { 1 => Some(713), 2 => Some(415), 3 => Some(715), 4 => Some(716), _ => None }
+}
+
+/* The ACOS5-EVO stores generated EC public keys as compressed points (02|03 || X); OpenSC accepts only
+   uncompressed points. Returns 04 || X || Y, or None if the point is not valid on the curve. */
+#[must_use]
+pub(crate) fn ec_point_uncompress(curve_indicator: u8, point: &[u8]) -> Option<Vec<u8>> {
+    let nid = evo_curve_nid(curve_indicator)?;
+    unsafe {
+        let group = EC_GROUP_new_by_curve_name(nid);
+        if group.is_null() { return None; }
+        let p = EC_POINT_new(group);
+        let bn_ctx = BN_CTX_new();
+        let mut result = None;
+        if !p.is_null() && !bn_ctx.is_null() && EC_POINT_oct2point(group, p, point.as_ptr(), point.len(), bn_ctx) == 1 {
+            let mut out = vec![0_u8; 1 + 2 * 66];
+            let n = EC_POINT_point2oct(group, p, 4 /* POINT_CONVERSION_UNCOMPRESSED */, out.as_mut_ptr(), out.len(), bn_ctx);
+            if n > 0 { out.truncate(n); result = Some(out); }
+        }
+        BN_CTX_free(bn_ctx);
+        EC_POINT_free(p);
+        EC_GROUP_free(group);
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests_ec_point {
+    use super::ec_point_uncompress;
+
+    #[test]
+    fn p256_generator() {
+        // P-256 base point G, compressed: 03 || Gx (Gy is odd)
+        let gx = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
+        let gy = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+        let h = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect::<Vec<u8>>();
+        let mut comp = vec![3_u8]; comp.extend(h(gx));
+        let mut unc = vec![4_u8]; unc.extend(h(gx)); unc.extend(h(gy));
+        assert_eq!(Some(unc), ec_point_uncompress(2, &comp));
+        let mut bad = vec![2_u8]; bad.extend([0xFF_u8; 32]);  // X >= field prime: invalid
+        assert_eq!(None, ec_point_uncompress(2, &bad));
+    }
+}
+
+fn der_len(len: usize) -> Vec<u8> {
+    match len {
+        0..=0x7F   => vec![u8::try_from(len).unwrap_or(0)],
+        0x80..=0xFF => vec![0x81, u8::try_from(len).unwrap_or(0)],
+        _          => vec![0x82, u8::try_from(len >> 8).unwrap_or(0), u8::try_from(len & 0xFF).unwrap_or(0)],
+    }
+}
+
+fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+    let mut v = vec![tag];
+    v.extend(der_len(value.len()));
+    v.extend_from_slice(value);
+    v
+}
+
+/* SubjectPublicKeyInfo for an EC public key (uncompressed point) on an ACOS5-EVO curve.
+   OpenSC (with pkcs15-ec-card-read-spki.patch) takes the curve parameters from it. */
+#[must_use]
+pub(crate) fn ec_spki_der(curve_indicator: u8, point: &[u8]) -> Option<Vec<u8>> {
+    let curve_oid: &[u8] = match curve_indicator {
+        1 => &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x21],                   // secp224r1
+        2 => &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07], // prime256v1
+        3 => &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22],                   // secp384r1
+        4 => &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23],                   // secp521r1
+        _ => return None,
+    };
+    let mut alg = vec![0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]; // id-ecPublicKey
+    alg.extend_from_slice(curve_oid);
+    let mut bits = vec![0_u8];
+    bits.extend_from_slice(point);
+    let mut body = der_tlv(0x30, &alg);
+    body.extend(der_tlv(0x03, &bits));
+    Some(der_tlv(0x30, &body))
+}
+
+#[cfg(test)]
+mod tests_ec_spki {
+    use super::ec_spki_der;
+
+    #[test]
+    fn p256_and_p521_lengths() {
+        let p256 = ec_spki_der(2, &[4_u8; 65]).unwrap();
+        assert_eq!(&p256[..4], &[0x30, 0x59, 0x30, 0x13]);
+        assert_eq!(0x5B, p256.len());
+        let p521 = ec_spki_der(4, &[4_u8; 133]).unwrap();
+        assert_eq!(&p521[..3], &[0x30, 0x81, 0x9B]); // long form length
+        assert_eq!(3 + 0x9B, p521.len());
     }
 }

@@ -530,6 +530,9 @@ pub(crate) fn sm_common_read(card: &mut sc_card,
     let ctx = unsafe { &mut *card.ctx };
     let f = if bin {c"sm_read_binary"} else {c"sm_read_record"};
     log3if!(ctx,f,line!(), c"called with flags %zu", flags);
+    if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+        return evo_sm_common_read(card, idx, buf, bin);
+    }
 
     if sm_manage_keyset(card).is_err() || sm_manage_initialize(card).is_err() {
         return log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM_NOT_INITIALIZED);
@@ -641,6 +644,9 @@ pub(crate) fn sm_common_update(card: &mut sc_card,
     let ctx = unsafe { &mut *card.ctx };
     let f = if bin {c"sm_update_binary"} else {c"sm_update_record"};
     log3if!(ctx,f,line!(), c"called with flags %zu", flags);
+    if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+        return evo_sm_common_update(card, idx, buf, flags, bin, has_ct);
+    }
 
     if sm_manage_keyset(card).is_err() || sm_manage_initialize(card).is_err() {
         return log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM_NOT_INITIALIZED);
@@ -1154,4 +1160,195 @@ pub(crate) fn sm_pin_cmd_get_policy(card: &mut sc_card, ctx: &mut sc_context,
         rv = SC_ERROR_SM;
     }
     Ok(log3ifr_ret!(ctx,f,line!(), rv))
+}
+
+
+/*
+ACOS5-EVO secure messaging, tested with a real ACOS5-EVO card.
+
+The EVO does not use the V2/V3 3DES session key scheme; per command:
+  * GET CHALLENGE (16 bytes) -> SSC; SSC+1 is the IV for command data, SSC+2 the IV for response data
+  * MAC = first 4 bytes of AES-CMAC(key, pad(89 04 CLA' INS P1 P2) || pad(data objects))
+    with CLA' = CLA ^ 0x0C and pad() = 0x80 00.. only if not already a multiple of 16
+  * command data objects: 97 01 Le (expects response data), 81 L data (plain) or 87 L pi E(data)
+  * response: [81 L data | 87 L pi E(data)] 99 02 SW1 SW2 8E 04 MAC, MAC over everything before 8E
+The key is the static AES key referenced by the SE record's CCT/CT (keyset_<aid>_02_enc in opensc.conf).
+Note: the challenge is not part of the MAC, so MAC-only commands could be replayed (card design).
+*/
+use crate::crypto::{aes_cbc_nopad, aes_cmac, AES_BLOCK_SIZE};
+use opensc_sys::types::SC_APDU_CASE_2_SHORT;
+
+const EVO_SM_MAX_CHUNK: usize = 224; // keeps padded SM command/response data within short APDU limits
+
+fn evo_pad(v: &mut Vec<u8>) {
+    if !v.len().is_multiple_of(AES_BLOCK_SIZE) {
+        v.push(0x80);
+        while !v.len().is_multiple_of(AES_BLOCK_SIZE) { v.push(0); }
+    }
+}
+
+fn evo_unpad(v: &[u8]) -> Option<&[u8]> {
+    let end = v.iter().rposition(|&b| b != 0)?;
+    if v[end] == 0x80 { Some(&v[..end]) } else { None }
+}
+
+fn evo_incr(b: &mut [u8; AES_BLOCK_SIZE]) {
+    for byte in b.iter_mut().rev() {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 { break; }
+    }
+}
+
+fn evo_sm_key(card: &sc_card) -> [u8; 3*DES_KEY_SZ] {
+    get_ck_enc_card(card) // 24 bytes from keyset_<aid>_02_enc: the AES-192 SM key
+}
+
+/// Send one command to an ACOS5-EVO under secure messaging.
+/// `data`: command data (empty: the command expects `le` response bytes).
+/// `encrypt`: command data as 87 (SE record has a CT) instead of plain 81.
+/// Returns the number of plain response bytes written to `out`.
+fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
+    -> Result<usize, i32>
+{
+    if card.ctx.is_null() { return Err(SC_ERROR_SM); }
+    let ctx = unsafe { &mut *card.ctx };
+    let f = c"evo_sm_transmit";
+    let key = evo_sm_key(card);
+
+    let mut ssc = [0_u8; AES_BLOCK_SIZE];
+    let mut apdu = build_apdu(ctx, &[0, 0x84, 0, 0, 16], SC_APDU_CASE_2_SHORT, &mut ssc);
+    let mut rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };  if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
+    rv = unsafe { sc_check_sw(card, apdu.sw1, apdu.sw2) };
+    if rv != SC_SUCCESS || apdu.resplen != AES_BLOCK_SIZE { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
+    evo_incr(&mut ssc);
+
+    let cla = cmd[0] ^ 0x0C;
+    let mut dos = Vec::with_capacity(data.len() + 20);
+    if data.is_empty() {
+        dos.extend_from_slice(&[0x97, 1, le]);
+    }
+    else if encrypt {
+        let mut padded = data.to_vec();
+        evo_pad(&mut padded);
+        let pi = u8::from(padded.len() != data.len());
+        let enc = aes_cbc_nopad(&padded, &key, &ssc, Encrypt);
+        dos.extend_from_slice(&[0x87, safe_int_try_from(enc.len() + 1), pi]);
+        dos.extend_from_slice(&enc);
+    }
+    else {
+        dos.extend_from_slice(&[0x81, safe_int_try_from(data.len())]);
+        dos.extend_from_slice(data);
+    }
+    let mut mac_in = vec![0x89, 4, cla, cmd[1], cmd[2], cmd[3]];
+    evo_pad(&mut mac_in);
+    let mut dos_padded = dos.clone();
+    evo_pad(&mut dos_padded);
+    mac_in.extend_from_slice(&dos_padded);
+    let mac = aes_cmac(&mac_in, &key);
+
+    let mut sm_cmd = vec![cla, cmd[1], cmd[2], cmd[3], safe_int_try_from(dos.len() + 6)];
+    sm_cmd.extend_from_slice(&dos);
+    sm_cmd.extend_from_slice(&[0x8E, 4, mac[0], mac[1], mac[2], mac[3], 0]);
+    let mut rbuf = [0_u8; 256];
+    let mut apdu = build_apdu(ctx, &sm_cmd, SC_APDU_CASE_4_SHORT, &mut rbuf);
+    rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };  if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
+    rv = unsafe { sc_check_sw(card, apdu.sw1, apdu.sw2) };
+    if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
+
+    let resp = &rbuf[..apdu.resplen];
+    if resp.len() < 10 || resp[resp.len()-6..resp.len()-4] != [0x8E, 4] {
+        return Err(log3ifr_ret!(ctx,f,line!(), c"Error: SM response without MAC", SC_ERROR_SM));
+    }
+    let body = &resp[..resp.len()-6];
+    let mut body_padded = body.to_vec();
+    evo_pad(&mut body_padded);
+    if aes_cmac(&body_padded, &key)[..4] != resp[resp.len()-4..] {
+        return Err(log3ifr_ret!(ctx,f,line!(), c"Error: SM response MAC mismatch", SC_ERROR_SM));
+    }
+    evo_incr(&mut ssc);
+
+    let mut plain_len = 0_usize;
+    let mut inner_sw: Option<(u8, u8)> = None;
+    let mut i = 0_usize;
+    while i + 2 <= body.len() {
+        let (tag, len) = (body[i], usize::from(body[i+1]));
+        if i + 2 + len > body.len() { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
+        let val = &body[i+2..i+2+len];
+        match tag {
+            0x81 => {
+                if val.len() > out.len() { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
+                out[..val.len()].copy_from_slice(val);
+                plain_len = val.len();
+            },
+            0x87 => {
+                if val.is_empty() || !(val.len()-1).is_multiple_of(AES_BLOCK_SIZE) { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
+                let dec = aes_cbc_nopad(&val[1..], &key, &ssc, Decrypt);
+                let plain = if val[0] == 1 { evo_unpad(&dec).ok_or(SC_ERROR_SM)? } else { &dec[..] };
+                if plain.len() > out.len() { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
+                out[..plain.len()].copy_from_slice(plain);
+                plain_len = plain.len();
+            },
+            0x99 if len == 2 => inner_sw = Some((val[0], val[1])),
+            _ => {},
+        }
+        i += 2 + len;
+    }
+    let Some((sw1, sw2)) = inner_sw else { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); };
+    rv = unsafe { sc_check_sw(card, u32::from(sw1), u32::from(sw2)) };
+    if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
+    Ok(plain_len)
+}
+
+fn evo_sm_common_read(card: &mut sc_card, idx: u16, buf: &mut [u8], bin: bool) -> i32 {
+    if card.ctx.is_null() { return SC_ERROR_SM; }
+    let ctx = unsafe { &mut *card.ctx };
+    let f = if bin {c"evo_sm_read_binary"} else {c"evo_sm_read_record"};
+    if sm_manage_keyset(card).is_err() {
+        return log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM_NOT_INITIALIZED);
+    }
+    let count = min(buf.len(), EVO_SM_MAX_CHUNK);
+    let cmd = if bin { let [hi, lo] = idx.to_be_bytes(); [0, 0xB0, hi, lo] }
+              else   { [0, 0xB2, safe_int_try_from(idx), 4] };
+    match evo_sm_transmit(card, cmd, &[], false, safe_int_try_from(count), &mut buf[..count]) {
+        Ok(n)  => log3ifr_ret!(ctx,f,line!(), safe_int_try_from::<usize, i32>(n)),
+        Err(e) => log3ifr_ret!(ctx,f,line!(), e),
+    }
+}
+
+fn evo_sm_common_update(card: &mut sc_card, idx: u16, buf: &[u8], flags: c_ulong, bin: bool, has_ct: bool) -> i32 {
+    if card.ctx.is_null() { return SC_ERROR_SM; }
+    let ctx = unsafe { &mut *card.ctx };
+    let f = if bin {c"evo_sm_update_binary"} else {c"evo_sm_update_record"};
+    if sm_manage_keyset(card).is_err() {
+        return log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM_NOT_INITIALIZED);
+    }
+    let count = min(buf.len(), EVO_SM_MAX_CHUNK);
+    let cmd = if bin { let [hi, lo] = idx.to_be_bytes(); [0, 0xD6, hi, lo] }
+              else if idx == 0 && flags == 0 { [0, 0xE2, 0, 0] }
+              else   { [0, 0xDC, safe_int_try_from(idx), 4] };
+    let mut dummy = [0_u8; 0];
+    match evo_sm_transmit(card, cmd, &buf[..count], has_ct, 0, &mut dummy) {
+        Ok(_)  => log3ifr_ret!(ctx,f,line!(), safe_int_try_from::<usize, i32>(count)),
+        Err(e) => log3ifr_ret!(ctx,f,line!(), e),
+    }
+}
+
+#[cfg(test)]
+mod tests_evo_sm {
+    use super::{evo_incr, evo_pad, evo_unpad};
+
+    #[test]
+    fn padding_and_ssc() {
+        let mut v = vec![1_u8; 14];
+        evo_pad(&mut v);
+        assert_eq!(16, v.len());
+        assert_eq!(&[1_u8; 14][..], evo_unpad(&v).unwrap());
+        let mut w = vec![1_u8; 16];
+        evo_pad(&mut w);
+        assert_eq!(16, w.len()); // no padding block for complete blocks
+        let mut ssc = [0_u8; 16];
+        ssc[15] = 0xFF;
+        evo_incr(&mut ssc);
+        assert_eq!([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0], ssc);
+    }
 }

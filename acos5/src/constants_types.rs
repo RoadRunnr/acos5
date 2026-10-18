@@ -215,7 +215,7 @@ pub(crate) const RSA_MAX_LEN_MODULUS      : usize = 512; // bytes; as bits: 512*
 pub(crate) const RSAPUB_MAX_LEN           : usize = 5 + 16 + RSA_MAX_LEN_MODULUS; // the max. file size (byte) requirement for RSA public key (4096 bit == 512 byte; 16 byte is the max. public exponent length)
 //b const RSAPRIV_MAX_LEN_STD      : usize = 5 +      RSA_MAX_LEN_MODULUS; // the max. file size (byte) requirement for RSA private key (non-CRT)
 //b const RSAPRIV_MAX_LEN_CRT      : usize = 5 +   5*(RSA_MAX_LEN_MODULUS/2); // the max. file size (byte) requirement for RSA private key stored in CRT manner
-pub(crate) const ECPUB_MAX_LEN            : usize = 0x48; // 72= 6 + 66 (aufgerundet 521/8)
+pub(crate) const ECPUB_MAX_LEN            : usize = 0x90; // 144 >= 5 + 1 + 2*66: also uncompressed P-521 points (EVO may store uncompressed, e.g. P-224)
 
 
 //https://cryptosys.net/pki/manpki/pki_paddingschemes.html
