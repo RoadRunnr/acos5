@@ -223,7 +223,7 @@ use opensc_sys::log::sc_dump_hex; /*sc_do_log, SC_LOG_DEBUG_NORMAL,*/
 mod    macros; // shared file among modules acos5, acos5_pkcs15
 
 mod        constants_types; // shared file among modules acos5, acos5_pkcs15
-use crate::constants_types::{CARD_DRV_SHORT_NAME, DataPrivate, SC_CARDCTL_ACOS5_SDO_CREATE,
+use crate::constants_types::{FDB_ECC_KEY_EF, CARD_DRV_SHORT_NAME, DataPrivate, SC_CARDCTL_ACOS5_SDO_CREATE,
                              SC_CARDCTL_ACOS5_SDO_GENERATE_KEY_FILES, SC_CARD_TYPE_ACOS5_64_V3, build_apdu,
                              SC_CARDCTL_ACOS5_SANITY_CHECK, GuardFile, file_id_from_path_value,
                              SC_CARD_TYPE_ACOS5_EVO_V4};
@@ -746,6 +746,10 @@ extern "C" fn acos5_pkcs15_create_key(profile_ptr: *mut sc_profile,
         if SC_PKCS15_TYPE_PRKEY_RSA == object.type_
              { 5 + keybits/16 * if dp.agc.do_generate_rsa_crt {5} else {2} }
         else { 71 };
+    /* profile templates use FDB 09 (RSA key EF); EC keys belong into an ECC key EF (19), per the ACOS5-EVO functional specification */
+    if SC_PKCS15_TYPE_PRKEY_EC == object.type_ {
+        file_priv.type_ = FDB_ECC_KEY_EF.into();
+    }
     card.drv_data = Box::into_raw(dp).cast::<c_void>();
 //
     if !file_priv.prop_attr.is_null() {
