@@ -201,9 +201,10 @@ use opensc_sys::pkcs15::{sc_pkcs15_card, sc_pkcs15_object, sc_pkcs15_prkey, sc_p
                          SC_PKCS15_PRKEY_ACCESS_EXTRACTABLE, SC_PKCS15_TYPE_PUBKEY_EC,
                          SC_PKCS15_PRKEY_USAGE_SIGN, SC_PKCS15_PRKEY_USAGE_DECRYPT, SC_PKCS15_TYPE_CLASS_MASK, SC_PKCS15_TYPE_SKEY,
                          SC_PKCS15_PRKEY_ACCESS_SENSITIVE, SC_PKCS15_PRKEY_ACCESS_ALWAYSSENSITIVE,
-                         SC_PKCS15_PRKEY_ACCESS_NEVEREXTRACTABLE, SC_PKCS15_PRKEY_ACCESS_LOCAL, SC_PKCS15_TYPE_PRKEY
+                         SC_PKCS15_PRKEY_ACCESS_NEVEREXTRACTABLE, SC_PKCS15_PRKEY_ACCESS_LOCAL, SC_PKCS15_TYPE_PRKEY,
+                         sc_pkcs15_bignum
 };
-//, sc_pkcs15_bignum, sc_pkcs15_pubkey_rsa
+//, sc_pkcs15_pubkey_rsa
 use opensc_sys::pkcs15_init::{sc_pkcs15init_operations, sc_pkcs15init_authenticate/*, sc_pkcs15init_pubkeyargs*/};
 use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_KEYPAD_MSG_TOO_LONG, SC_ERROR_SECURITY_STATUS_NOT_SATISFIED,
                          SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_NOT_SUPPORTED, /*SC_ERROR_NON_UNIQUE_ID,*/
@@ -213,7 +214,7 @@ use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_KEYPAD_MSG_TOO_LONG, SC_ERROR_SECU
 };
 //use opensc_sys::sm::{sm_info};
 use opensc_sys::types::{sc_file, sc_path, SC_AC_OP_CREATE_EF, SC_AC_OP_DELETE, SC_AC_OP_READ, SC_AC_OP_DELETE_SELF,//SC_AC_OP_DELETE_SELF, SC_FILE_TYPE_INTERNAL_EF,
-                        SC_AC_OP_UPDATE, SC_APDU_CASE_1/*, SC_APDU_CASE_3*/, SC_PATH_TYPE_PATH, sc_acl_entry};
+                        SC_AC_OP_UPDATE, SC_APDU_CASE_1, SC_APDU_CASE_3_SHORT, SC_PATH_TYPE_PATH, sc_acl_entry};
 // SC_FILE_EF_TRANSPARENT, SC_FILE_STATUS_CREATION, SC_MAX_PATH_SIZE,  SC_PATH_TYPE_FILE_ID, SC_AC_OP_DELETE
 //use opensc_sys::types::{/*SC_MAX_CRTS_IN_SE, sc_crt*/};
 use opensc_sys::log::sc_dump_hex; /*sc_do_log, SC_LOG_DEBUG_NORMAL,*/
@@ -1016,8 +1017,14 @@ extern "C" fn acos5_pkcs15_store_key(profile_ptr: *mut sc_profile, p15card_ptr: 
                                      object_ptr: *mut sc_pkcs15_object, key_ptr: *mut sc_pkcs15_prkey) -> i32
 {
     if p15card_ptr.is_null() || unsafe { (*p15card_ptr).card.is_null() || (*(*p15card_ptr).card).ctx.is_null() } ||
-        object_ptr.is_null() || unsafe { (*object_ptr).data.is_null() } || key_ptr.is_null() ||
-        unsafe { ((*object_ptr).type_ & SC_PKCS15_TYPE_CLASS_MASK) != SC_PKCS15_TYPE_SKEY } {
+        object_ptr.is_null() || unsafe { (*object_ptr).data.is_null() } || key_ptr.is_null() {
+        return SC_ERROR_INVALID_ARGUMENTS;
+    }
+    let object_class = unsafe { (*object_ptr).type_ & SC_PKCS15_TYPE_CLASS_MASK };
+    if object_class == SC_PKCS15_TYPE_PRKEY {
+        return acos5_pkcs15_store_key_asym(profile_ptr, p15card_ptr, object_ptr, key_ptr);
+    }
+    if object_class != SC_PKCS15_TYPE_SKEY {
         return SC_ERROR_INVALID_ARGUMENTS;
     }
     let p15card = unsafe { &mut *p15card_ptr };
@@ -1109,6 +1116,136 @@ extern "C" fn acos5_pkcs15_store_key(profile_ptr: *mut sc_profile, p15card_ptr: 
         }
     }
 } // acos5_pkcs15_store_key
+
+
+/* EVO curve code (1..4) -> field length in bytes (P-224/256/384/521) */
+fn ec_field_len(curve: u8) -> usize { match curve { 1 => 28, 2 => 32, 3 => 48, 4 => 66, _ => 0 } }
+
+/* big-endian value of `bn`, left-padded (or left-truncated) to exactly `len` bytes */
+fn bn_fixed(bn: &sc_pkcs15_bignum, len: usize) -> Vec<u8> {
+    let mut v = vec![0_u8; len];
+    if !bn.data.is_null() && bn.len > 0 {
+        let src = unsafe { from_raw_parts(bn.data, bn.len) };
+        let n = src.len().min(len);
+        v[len - n..].copy_from_slice(&src[src.len() - n..]);
+    }
+    v
+}
+
+/* PUT KEY `80 DA` writing `data` at `offset` of the currently selected key EF, chunked at 0xFF.
+   Accepts SW 90 00 and 63 01 (pairwise consistency not yet confirmable). */
+fn acos5_put_key(card: &mut sc_card, offset: usize, data: &[u8]) -> i32 {
+    let ctx = unsafe { &mut *card.ctx };
+    let mut pos = 0;
+    while pos < data.len() {
+        let end = (pos + 0xFF).min(data.len());
+        let chunk = &data[pos..end];
+        let off = offset + pos;
+        let mut cmd = vec![0x80_u8, 0xDA, u8::try_from(off >> 8).unwrap_or(0),
+                           u8::try_from(off & 0xFF).unwrap_or(0), u8::try_from(chunk.len()).unwrap_or(0)];
+        cmd.extend_from_slice(chunk);
+        let mut apdu = build_apdu(ctx, &cmd, SC_APDU_CASE_3_SHORT, &mut []);
+        let rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };
+        if rv != SC_SUCCESS { return rv; }
+        if !(apdu.sw1 == 0x90 && apdu.sw2 == 0x00) && !(apdu.sw1 == 0x63 && apdu.sw2 == 0x01) {
+            return SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
+        }
+        pos = end;
+    }
+    SC_SUCCESS
+}
+
+/* Import an RSA or EC private key with PUT KEY. The key EF pair was created, activated and
+   UPDATE-authenticated by acos5_pkcs15_create_key, which also left the file ids, curve/length and
+   key-type code in DataPrivate.agc. The public EF is written first so the private record's on-card
+   pairwise test passes. See docs/acos5-evo-commands.md section 7 (PUT KEY). */
+#[named]
+fn acos5_pkcs15_store_key_asym(profile_ptr: *mut sc_profile, p15card_ptr: *mut sc_pkcs15_card,
+                               object_ptr: *mut sc_pkcs15_object, key_ptr: *mut sc_pkcs15_prkey) -> i32 {
+    let card = unsafe { &mut *(*p15card_ptr).card };
+    let ctx = unsafe { &mut *card.ctx };
+    let f_cstr = CString::new(function_name!()).expect("CString::new failed");
+    let f = f_cstr.as_c_str();
+    let object = unsafe { &mut *object_ptr };
+    let key = unsafe { &mut *key_ptr };
+    log3ifc!(ctx,f,line!());
+
+    if object.type_ == SC_PKCS15_TYPE_PRKEY_EC && card.type_ != SC_CARD_TYPE_ACOS5_EVO_V4 {
+        return SC_ERROR_NOT_SUPPORTED;
+    }
+
+    let dp = unsafe { Box::from_raw(card.drv_data.cast::<DataPrivate>()) };
+    let agc = dp.agc;
+    let (fid_priv, fid_pub, curve, lencode, typecode) =
+        (agc.file_id_priv, agc.file_id_pub, agc.key_curve_code, agc.key_len_code, agc.key_priv_type_code);
+    if fid_priv == 0 || fid_pub == 0 || !dp.files.contains_key(&fid_priv) || !dp.files.contains_key(&fid_pub) {
+        let _unused = Box::leak(dp);
+        log3ifr!(ctx,f,line!(), c"no key EF pair prepared by create_key", SC_ERROR_INVALID_ARGUMENTS);
+        return SC_ERROR_INVALID_ARGUMENTS;
+    }
+    let (pv, pl) = { let r = &dp.files[&fid_priv]; (r.0, r.1[1]) };
+    let (qv, ql) = { let r = &dp.files[&fid_pub];  (r.0, r.1[1]) };
+    let _unused = Box::leak(dp);
+    let path_priv = sc_path { type_: SC_PATH_TYPE_PATH, value: pv, len: pl.into(), ..sc_path::default() };
+    let path_pub  = sc_path { type_: SC_PATH_TYPE_PATH, value: qv, len: ql.into(), ..sc_path::default() };
+    let priv_be = fid_priv.to_be_bytes();
+    let pub_be  = fid_pub.to_be_bytes();
+    let base = if typecode > 3 { typecode - 3 } else { typecode };   /* strip a CRT bit if present */
+
+    let pub_writes:  Vec<(usize, Vec<u8>)>;
+    let priv_writes: Vec<(usize, Vec<u8>)>;
+    if object.type_ == SC_PKCS15_TYPE_PRKEY_EC {
+        let flen = ec_field_len(curve);
+        let ec = unsafe { &key.u.ec };
+        if flen == 0 || ec.ecpointQ.value.is_null() || ec.ecpointQ.len == 0 {
+            return SC_ERROR_INVALID_ARGUMENTS;
+        }
+        let point = unsafe { from_raw_parts(ec.ecpointQ.value, ec.ecpointQ.len) }.to_vec();
+        let mut pubrec = vec![0x00_u8, curve, priv_be[0], priv_be[1], 0x0A];
+        pubrec.extend_from_slice(&point);
+        /* EC keys on the EVO are sign-only; the private key type byte must be 1 (sign), not the
+           usage-derived code (a value implying decrypt is rejected by the card). */
+        let mut privrec = vec![1_u8, curve, pub_be[0], pub_be[1], 0x0A];
+        privrec.extend_from_slice(&bn_fixed(&ec.privateD, flen));
+        pub_writes  = vec![(0, pubrec)];
+        priv_writes = vec![(0, privrec)];
+    }
+    else {
+        let rsa = unsafe { &key.u.rsa };
+        let modlen = usize::from(lencode) * 16;
+        if modlen == 0 || rsa.modulus.data.is_null() {
+            return SC_ERROR_INVALID_ARGUMENTS;
+        }
+        pub_writes = vec![(5, bn_fixed(&rsa.exponent, 16)), (0x15, bn_fixed(&rsa.modulus, modlen)),
+                          (0, vec![0x00_u8, lencode, priv_be[0], priv_be[1], 0x03])];
+        let crt = !rsa.p.data.is_null() && rsa.p.len > 0 && !rsa.q.data.is_null() && rsa.q.len > 0;
+        if crt {
+            let half = modlen / 2;
+            let mut blob = Vec::with_capacity(5 * half);
+            for bn in [&rsa.p, &rsa.q, &rsa.dmp1, &rsa.dmq1, &rsa.iqmp] { blob.extend(bn_fixed(bn, half)); }
+            priv_writes = vec![(5, blob), (0, vec![base + 3, lencode, pub_be[0], pub_be[1], 0x03])];
+        }
+        else {
+            priv_writes = vec![(5, bn_fixed(&rsa.d, modlen)), (0, vec![base, lencode, pub_be[0], pub_be[1], 0x03])];
+        }
+    }
+
+    for (path, writes) in [(path_pub, pub_writes), (path_priv, priv_writes)] {
+        let mut file = null_mut();
+        let guard_file = GuardFile::new(&raw mut file);
+        let mut rv = unsafe { sc_select_file(card, &raw const path, *guard_file) };
+        if rv != SC_SUCCESS { return SC_ERROR_FILE_NOT_FOUND; }
+        rv = unsafe { sc_pkcs15init_authenticate(profile_ptr, p15card_ptr, file, i32::try_from(SC_AC_OP_UPDATE).unwrap()) };
+        if rv != SC_SUCCESS { return SC_ERROR_SECURITY_STATUS_NOT_SATISFIED; }
+        for (off, data) in &writes {
+            rv = acos5_put_key(card, *off, data);
+            if rv != SC_SUCCESS { log3ifr!(ctx,f,line!(), c"PUT KEY failed", rv); return rv; }
+        }
+    }
+    let _ = object;
+    log3ifr!(ctx,f,line!(), SC_SUCCESS);
+    SC_SUCCESS
+} // acos5_pkcs15_store_key_asym
 
 
 // will be called for both RSA and symmetric key
