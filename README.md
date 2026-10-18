@@ -1,6 +1,8 @@
-Help wanted from users of an EVO card or CryptoMate EVO:
+Help wanted from users of a CryptoMate EVO:
 My hardware, a CryptoMate EVO cryptographic USB Token seems to be buggy, or the underlying software: Recurrent it stops to work, seems to need a reset?
 Reports from EVO users might help to isolate the problem.
+(With an ACOS5-EVO smart card in a CCID reader, operated with protocol T=0 as described in section ACOS5-EVO below,
+extensive tests showed no such problem.)
 
 
 # acos5  
@@ -28,9 +30,54 @@ External modules need some configuration once in opensc.conf, such that they get
 For some reason (that I don't recall now) I didn't decide for [openCryptoki](https://www.ibm.com/docs/en/linux-on-systems?topic=stack-opencryptoki-overview "https://www.ibm.com/docs/en/linux-on-systems?topic=stack-opencryptoki-overview") (which also consists of an implementation of the PKCS #11 API), but it looks like it would have been an eligible alternative for me to implement ACOS5 hardware specific stuff for an open-source PKCS#11 library [github/opencryptoki](https://github.com/opencryptoki/opencryptoki "https://github.com/opencryptoki/opencryptoki").
 
 
-Support for the EVO chip is given partially, work in progress to be completed. By default, this hardware is operated in protocol T=1 (different from the other supported hardware, T=0). OpenSC wants to handle the APDU case 'SC_APDU_CASE_4_SHORT' differently for T=0/T=1 protocols, but that's not how the ACOS5 EVO behaves. Thus, currently, for the EVO card only, patching OpenSC source code is required (use file diff_apdu_c.txt) like that:<br>
+### ACOS5-EVO
 
-user@host:~/path/to/opensc-0.27.1$ patch -b src/libopensc/apdu.c diff_apdu_c.txt
+Tested with a real ACOS5-EVO card (ATR 3B:9E:96:80:01:41:05:43:00:00:00:00:00:00:00:00:00:90:00:1E, default
+non-FIPS configuration mode) in a CCID reader, OpenSC 0.27.1:
+- RSA: on-card key generation, sign and decrypt (tested with 2048 and 4096 bit keys)
+- ECC: on-card key generation and ECDSA for the curves P-224, P-256, P-384 and P-521
+- Secure Messaging with AES keys (SM-sign = CMAC, SM-enc = AES-CBC), for read/update binary/record
+
+Not yet supported for the EVO: ECDH, Secure Messaging for PIN commands, the FIPS 140-2 configuration mode.
+
+**Protocol T=0 is required.** The card defaults to T=1, but under T=1 it rejects every case 4 command that carries
+an Le byte with SW 6700 (e.g. SELECT with FCI, Secure Messaging, PSO Compute Digital Signature) and expects
+case 4 commands without Le, answered by 61XX and GET RESPONSE. That contradicts ISO/IEC 7816-3:2006 12.3.5
+(over T=1 a command APDU is mapped onto the information field without any change, i.e. including Le), while
+over T=0 (ISO/IEC 7816-3:2006 12.2.5, Le is cut off) the card is conforming. OpenSC follows the standard, so let
+OpenSC use T=0 for the EVO in opensc.conf (inside `app default`; the mask covers the EVO revisions 41 05 4X and
+ignores the check byte):
+```
+	card_atr 3B:9E:96:80:01:41:05:43:00:00:00:00:00:00:00:00:00:90:00:1E {
+		atrmask = "FF:FF:FF:FF:FF:FF:FF:F0:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:00";
+		force_protocol = "t0";
+	}
+```
+With T=0 the driver doesn't use extended APDUs: longer commands (e.g. RSA-4096 decrypt) use command chaining,
+longer responses GET RESPONSE. The former alternative, patching OpenSC with diff_apdu_c.txt for T=1, is not
+recommended anymore: it changes the case 4 handling of OpenSC for all cards, not only for the EVO.
+
+**EC keys need an OpenSC fix.** The EVO keeps public keys in internal key files (readable only with Get Key in the
+card's own format), so OpenSC reads them through the driver's read_public_key, which returns an SPKI for EC keys.
+OpenSC 0.27.1 decodes that result as a bare EC point and loses the curve (PKCS#11 then has no CKA_EC_PARAMS).
+The fix is [OpenSC PR #3884](https://github.com/OpenSC/OpenSC/pull/3884); until it is part of a release, apply
+it to OpenSC. RSA keys are not affected.
+
+**Card initialization differs from V2.00/V3.00** (card_initialization.scriptor is written for those):
+- don't write the configuration mode byte (factory default 01 = non-FIPS)
+- free space: `80 14 04 00 03` (3 bytes)
+- symmetric key records: `[0x80|key id] 03 FF FF <error counter> <algo ref> <key>`, algo ref 22/24/28 for
+  AES-128/192/256 (14 for 3DES-168)
+- SE records for SM reference the key explicitly and use EVO algorithm references, e.g.
+  CCT `B4 09 83 01 82 95 01 30 80 01 1D` (AES CMAC) and CT `B8 09 83 01 82 95 01 30 80 01 15` (AES CBC)
+- EF.TokenInfo: omit supportedAlgorithms (the V2.00/V3.00 algorithm references don't apply)
+- EC key files are created with FDB 0x19 (ECC key EF)
+
+**Secure Messaging on the EVO** doesn't use the V2.00/V3.00 session keys: for each command the driver gets a fresh
+16 byte challenge from the card (SSC; SSC+1 and SSC+2 are the IVs for command and response data) and uses the
+static AES key referenced by the SE record, configured as keyset_..._02_enc in opensc.conf (see below). The MAC
+doesn't include the challenge, so commands protected only by SM-sign could be replayed; prefer SM-enc where it
+matters.
 
 The respective reference manual for Your hardware is available on request from: info@acs.com.hk
 
@@ -167,6 +214,13 @@ app default {
 		ifd_serial = "11:22:33:44:55:66:77:88"; # changing this "match all" default value to Your actual hardware serialnr (8 bytes, for ACOS5 V2.00 append zero bytes) needs compiler switch --cfg ifd_serial_constrained_for_sm
 		keyset_41434F53504B43532D313576312E3030_02_mac = "F1:E0:D0:C1:B0:A1:89:08:07:16:45:04:13:02:01:F1:89:FE:B3:C8:37:45:16:94"; # corresponds to record# 1/key_reference 0x81 (external auth. key host kh in EF 0x4102); this will be authenticated
 		keyset_41434F53504B43532D313576312E3030_02_enc = "F1:01:02:13:04:85:16:07:08:49:A1:B0:C1:D0:E0:F1:45:89:B3:16:FE:94:37:C8"; # corresponds to record# 2/key_reference 0x82 (internal auth. key card kc in EF 0x4102)
+		# ACOS5-EVO: keyset_..._02_enc is the AES key used for Secure Messaging, i.e. the key record that the SE
+		# records' CCT/CT reference (24 bytes = AES-192, e.g. key reference 0x82 in EF 0x4102); _02_mac is not used for SM
+	}
+	# ACOS5-EVO: force protocol T=0, see section ACOS5-EVO
+	card_atr 3B:9E:96:80:01:41:05:43:00:00:00:00:00:00:00:00:00:90:00:1E {
+		atrmask = "FF:FF:FF:FF:FF:FF:FF:F0:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:FF:00";
+		force_protocol = "t0";
 	}
 ...
 .........
