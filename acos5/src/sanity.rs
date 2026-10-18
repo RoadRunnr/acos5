@@ -180,6 +180,9 @@ pub(crate) fn sanity_check(card: &mut sc_card, app_name: &CStr) -> Result<(), i3
                     }
                 }
 println!("[X] DF/MF {key_dfmf:04X} references found: {index_used:X?} ");
+                /* SE ids referenced with / without the SM bit: SM references need a CCT, others an AT */
+                let sm_refs:    HashSet<u8> = index_used.iter().filter(|&&i| (i & 0x40) > 0).map(|&i| i & 0x0F).collect();
+                let plain_refs: HashSet<u8> = index_used.iter().filter(|&&i| (i & 0x40) == 0).map(|&i| i & 0x0F).collect();
                 let mut vec_add_to_set = Vec::with_capacity(8);
                 for &index in &index_used {
                     if (index & 0x30) > 0 {
@@ -200,14 +203,15 @@ println!("[X] DF/MF {key_dfmf:04X} reference {index:X} has MSB bit set: TODO che
 println!("[X] DF/MF {key_dfmf:04X} references (reduced set) found: {index_used:X?} ");
                 let mut once = false;
                 for &index in &index_used {
-                    if index & 0x40 > 0 &&
+                    if sm_refs.contains(&(index & 0x0F)) &&
                         se_get_references(card, key_dfmf, index & 0x0F, &sc_crt::new_CCT(0x30), false).is_empty() &&
                         se_get_references(card, key_dfmf, index & 0x0F, &sc_crt::new_CCT(0x70), false).is_empty()
                     {
                         once = true;
                         println!("[X] ERROR: The record #{} in SE-file {} shall be used for SM, but it has no suitable CCT template", index & 0x0F, child_id);
                     }
-                    if se_get_references(card, key_dfmf, index & 0x0F, &sc_crt::new_AT(0x88), true).is_empty() {
+                    if plain_refs.contains(&(index & 0x0F)) &&
+                        se_get_references(card, key_dfmf, index & 0x0F, &sc_crt::new_AT(0x88), true).is_empty() {
                         once = true;
                         println!("[X] ERROR: There is no record #{} in SE-file {}, but it gets referenced for Access Control", index & 0x0F, child_id);
                     }

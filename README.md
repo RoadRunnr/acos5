@@ -37,6 +37,10 @@ non-FIPS configuration mode) in a CCID reader, OpenSC 0.27.1:
 - RSA: on-card key generation, sign and decrypt (tested with 2048 and 4096 bit keys)
 - ECC: on-card key generation and ECDSA for the curves P-224, P-256, P-384 and P-521
 - Secure Messaging with AES keys (SM-sign = CMAC, SM-enc = AES-CBC), for read/update binary/record
+- certificates, PIN change/unblock, deleting keys, pkcs15-init --sanity-check, PIN retry counter
+- applications: OpenSSH (ssh-agent with the PKCS#11 module, CKM_ECDSA), OpenSSL pkcs11-provider, NSS
+
+Private (RSA/EC) keys can't be imported, only generated on the card (as for V2.00/V3.00).
 
 Not yet supported for the EVO: ECDH, Secure Messaging for PIN commands, the FIPS 140-2 configuration mode.
 
@@ -72,6 +76,7 @@ it to OpenSC. RSA keys are not affected.
   CCT `B4 09 83 01 82 95 01 30 80 01 1D` (AES CMAC) and CT `B8 09 83 01 82 95 01 30 80 01 15` (AES CBC)
 - EF.TokenInfo: omit supportedAlgorithms (the V2.00/V3.00 algorithm references don't apply)
 - EC key files are created with FDB 0x19 (ECC key EF)
+- certificates are stored directly in EF.CDF: make it large enough (e.g. 6 KB for a few certificates)
 
 **Secure Messaging on the EVO** doesn't use the V2.00/V3.00 session keys: for each command the driver gets a fresh
 16 byte challenge from the card (SSC; SSC+1 and SSC+2 are the IVs for command and response data) and uses the

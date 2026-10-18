@@ -393,7 +393,7 @@ use function_name::named;
 use opensc_sys::opensc::{sc_card, sc_card_driver, sc_card_operations, sc_security_env, sc_pin_cmd_data,
                          sc_get_iso7816_driver, sc_get_mf_path, sc_file_set_prop_attr, sc_select_file,
                          sc_read_binary, sc_get_version, sc_context, sc_reader,
-                         SC_ALGORITHM_RSA_HASH_NONE, SC_ALGORITHM_ECDSA_RAW, SC_CARD_CAP_RNG,
+                         SC_ALGORITHM_RSA_HASH_NONE, SC_ALGORITHM_ECDSA_RAW, SC_ALGORITHM_ECDSA_HASH_NONE, SC_CARD_CAP_RNG,
                          SC_CARD_CAP_USE_FCI_AC, SC_READER_SHORT_APDU_MAX_SEND_SIZE,
                          SC_READER_SHORT_APDU_MAX_RECV_SIZE, SC_ALGORITHM_RSA, SC_ALGORITHM_ONBOARD_KEY_GEN,
                          SC_ALGORITHM_RSA_RAW, SC_SEC_OPERATION_SIGN, SC_SEC_OPERATION_DECIPHER,
@@ -1063,8 +1063,10 @@ fn acos5_init(card: &mut sc_card, ctx: &mut sc_context, reader: &mut sc_reader) 
     }
 // ECC
     if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
-        let flags = SC_ALGORITHM_ONBOARD_KEY_GEN | SC_ALGORITHM_ECDSA_RAW; /*| SC_ALGORITHM_ECDH_CDH_RAW |
-                           SC_ALGORITHM_ECDSA_HASH_NONE | SC_ALGORITHM_ECDSA_HASH_SHA1*/
+        /* ECDSA_HASH_NONE: the card signs the given hash as is; OpenSC registers CKM_ECDSA (used e.g. by OpenSSH)
+           only together with ECDSA_RAW */
+        let flags = SC_ALGORITHM_ONBOARD_KEY_GEN | SC_ALGORITHM_ECDSA_RAW | SC_ALGORITHM_ECDSA_HASH_NONE; /*| SC_ALGORITHM_ECDH_CDH_RAW |
+                           SC_ALGORITHM_ECDSA_HASH_SHA1*/
         let ext_flags = SC_ALGORITHM_EXT_EC_NAMEDCURVE | SC_ALGORITHM_EXT_EC_COMPRESS;
         for elem in &mut acos5_supported_ec_curves() {
             #[cfg(    any(v0_20_0, v0_21_0, v0_22_0, v0_23_0, v0_24_0))]
