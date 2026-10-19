@@ -2574,10 +2574,18 @@ pub(crate) fn evo_key_sm_use(card: &mut sc_card, file_id: u16, scb_idx: usize, c
 /// `SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT`: PUT KEY `80 DA P1 P2` (P1 P2 = offset) into the selected key EF, in plain or
 /// under SM as the key EF's UPDATE SCB decides (`SmCmd::PutKey`: mode `transmit` refuses it in plain). The data are
 /// split into commands of up to 255 bytes in plain and 96 bytes under SM (each `87` object stays below 128 bytes),
-/// with the offset advanced per command. SW `63 01` (key pair not consistent yet) counts as success.
+/// with the offset advanced per command. SW `63 01` (key pair not consistent yet) counts as success: in plain, and
+/// under SM only as the MAC-checked inner SW (see `put_key_sw_ok`).
 ///
 /// # Errors
 /// As `evo_key_sm_use` and `evo_sm_transmit_sw`; the mapped SW if the card refuses a command.
+/// Whether a PUT KEY status word counts as success: `90 00`, or `63 01` (key pair not consistent yet) when it is
+/// authentic, that is a plain command's SW or the inner SW of an SM response. Under SM, an outer `63 01` (an answer
+/// without SM wrapping and MAC) is an error.
+pub(crate) fn put_key_sw_ok(sw: u16, authentic: bool) -> bool {
+    sw == 0x9000 || (sw == 0x6301 && authentic)
+}
+
 pub(crate) fn evo_put_key(card: &mut sc_card, ctl: &mut CardCtlEvoSmTransmit) -> Result<i32, i32>
 {
     let ctx = unsafe { &mut *card.ctx };
@@ -2593,21 +2601,22 @@ pub(crate) fn evo_put_key(card: &mut sc_card, ctl: &mut CardCtlEvoSmTransmit) ->
     let offset = usize::from(u16::from_be_bytes([ctl.cmd[2], ctl.cmd[3]]));
     for (n, part) in data.chunks(chunk).enumerate() {
         let [hi, lo] = safe_int_try_from::<usize, u16>(offset + n * chunk).to_be_bytes();
-        let sw = if sm_use == SmUse::Plain {
+        let (sw, authentic) = if sm_use == SmUse::Plain {
             let mut cmd = vec![0x80_u8, 0xDA, hi, lo, safe_int_try_from(part.len())];
             cmd.extend_from_slice(part);
             let mut apdu = build_apdu(ctx, &cmd, SC_APDU_CASE_3_SHORT, &mut []);
             let rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };
             cmd.fill(0);
             if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
-            u16::from_be_bytes([safe_int_try_from(apdu.sw1), safe_int_try_from(apdu.sw2)])
+            (u16::from_be_bytes([safe_int_try_from(apdu.sw1), safe_int_try_from(apdu.sw2)]), true)
         }
         else {
-            evo_sm_transmit_sw(card, [0x80, 0xDA, hi, lo], part, sm_use == SmUse::MacEnc, 0, &mut [])
-                .map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?.1
+            let (_, sw, inner) = evo_sm_transmit_sw(card, [0x80, 0xDA, hi, lo], part, sm_use == SmUse::MacEnc, 0, &mut [])
+                .map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
+            (sw, inner)
         };
         ctl.sw = sw;
-        if sw != 0x9000 && sw != 0x6301 {
+        if !put_key_sw_ok(sw, authentic) {
             let [sw1, sw2] = sw.to_be_bytes();
             let rv = unsafe { sc_check_sw(card, u32::from(sw1), u32::from(sw2)) };
             return Err(log3ifr_ret!(ctx,f,line!(), if rv == SC_SUCCESS { SC_ERROR_CARD_CMD_FAILED } else { rv }));
@@ -2721,8 +2730,19 @@ fn plain_update(card: &mut sc_card, idx: u16, buf: &[u8], flags: c_ulong, bin: b
 mod tests {
     use super::{convert_amdo_to_cla_ins_p1_p2_array, algo_ref_mse_sedo, SC_SEC_OPERATION_SIGN,
                 trailing_blockcipher_padding_calculate, trailing_blockcipher_padding_get_length,
-                SC_ALGORITHM_RSA};
+                SC_ALGORITHM_RSA, put_key_sw_ok};
     use crate::constants_types::*;
+
+    #[test]
+    fn put_key_63_01_only_when_authentic() {
+        /* plain SW or MAC-checked inner SW */
+        assert!(put_key_sw_ok(0x9000, true));
+        assert!(put_key_sw_ok(0x6301, true));
+        /* outer SW of a command sent under SM, without SM wrapping */
+        assert!(!put_key_sw_ok(0x6301, false));
+        assert!(!put_key_sw_ok(0x6A80, false));
+        assert!(!put_key_sw_ok(0x6A80, true));
+    }
 
     #[cfg(dont_test__this_signature_changed)]
     #[test]

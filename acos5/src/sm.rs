@@ -1228,8 +1228,9 @@ pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey
 ///   material never go in plain, neither as a plain APDU nor in a MAC-only `81` object. The card accepts only
 ///   the form its access condition dictates, so no command is forced into SM or into encryption.
 ///
-/// PSO DECIPHER is always plain: the card refused every SM form tried, and it accepts the plain form on key EFs
-/// whose use condition asks for SM (tested with a real ACOS5-EVO card).
+/// PSO DECIPHER is always plain: the card accepts the plain form on key EFs whose use condition asks for SM, and no
+/// SM form is known to work (tested with a real ACOS5-EVO card; the chained SM forms tried coded the `87` length
+/// as `81 xx` / `82 xx xx` and were refused; one-byte lengths were not tried).
 ///
 /// # Errors
 /// `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` for mode `none` with an SCB that requires SM, and for mode
@@ -1321,7 +1322,7 @@ fn evo_sm_key(card: &mut sc_card) -> Result<[u8; 3*DES_KEY_SZ], i32> {
 pub(crate) fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
     -> Result<usize, i32>
 {
-    let (len, sw) = evo_sm_transmit_sw(card, cmd, data, encrypt, le, out)?;
+    let (len, sw, _) = evo_sm_transmit_sw(card, cmd, data, encrypt, le, out)?;
     let [sw1, sw2] = sw.to_be_bytes();
     let rv = unsafe { sc_check_sw(card, u32::from(sw1), u32::from(sw2)) };
     if rv != SC_SUCCESS {
@@ -1332,9 +1333,10 @@ pub(crate) fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], enc
 }
 
 /// As `evo_sm_transmit`, but returns the status word with the response length instead of checking it: the
-/// inner SW from the 99 object, or the outer SW if the card answered without SM.
+/// inner SW from the 99 object, or the outer SW if the card answered without SM. The third value is true for
+/// an inner SW (covered by the response MAC) and false for an outer SW (not authenticated).
 pub(crate) fn evo_sm_transmit_sw(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
-    -> Result<(usize, u16), i32>
+    -> Result<(usize, u16, bool), i32>
 {
     let mut key = evo_sm_key(card)?;
     let result = evo_sm_transmit_key(card, &key, cmd, data, encrypt, le, out);
@@ -1343,7 +1345,7 @@ pub(crate) fn evo_sm_transmit_sw(card: &mut sc_card, cmd: [u8; 4], data: &[u8], 
 }
 
 fn evo_sm_transmit_key(card: &mut sc_card, key: &[u8; 3*DES_KEY_SZ], cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8,
-                       out: &mut [u8]) -> Result<(usize, u16), i32>
+                       out: &mut [u8]) -> Result<(usize, u16, bool), i32>
 {
     if card.ctx.is_null() { return Err(SC_ERROR_SM); }
     let ctx = unsafe { &mut *card.ctx };
@@ -1356,15 +1358,19 @@ fn evo_sm_transmit_key(card: &mut sc_card, key: &[u8; 3*DES_KEY_SZ], cmd: [u8; 4
     if rv != SC_SUCCESS || apdu.resplen != AES_BLOCK_SIZE { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
     evo_incr(&mut ssc);
 
-    let dos = evo_sm_wrap(key, &ssc, cmd, data, encrypt, le);
-    let mut sm_cmd = vec![cmd[0] ^ 0x0C, cmd[1], cmd[2], cmd[3], safe_int_try_from(dos.len())];
+    let mut dos = evo_sm_wrap(key, &ssc, cmd, data, encrypt, le);
+    let mut sm_cmd = Vec::with_capacity(dos.len() + 6);
+    sm_cmd.extend_from_slice(&[cmd[0] ^ 0x0C, cmd[1], cmd[2], cmd[3], safe_int_try_from(dos.len())]);
     sm_cmd.extend_from_slice(&dos);
     sm_cmd.push(0);
+    wipe(&mut dos);
     /* the response is collected here with GET RESPONSE (61 XX under T=0): it may be longer than 256 bytes */
     let mut rbuf = [0_u8; 256];
     let mut apdu = build_apdu(ctx, &sm_cmd, SC_APDU_CASE_4_SHORT, &mut rbuf);
     apdu.flags |= SC_APDU_FLAGS_NO_GET_RESP;
-    rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };  if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
+    rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };
+    wipe(&mut sm_cmd);
+    if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
     let mut resp = rbuf[..apdu.resplen].to_vec();
     let (mut sw1, mut sw2) = (apdu.sw1, apdu.sw2);
     while sw1 == 0x61 {
@@ -1379,19 +1385,21 @@ fn evo_sm_transmit_key(card: &mut sc_card, key: &[u8; 3*DES_KEY_SZ], cmd: [u8; 4
         (sw1, sw2) = (gr.sw1, gr.sw2);
     }
     if (sw1, sw2) != (0x90, 0) {
-        return Ok((0, u16::from_be_bytes([safe_int_try_from(sw1), safe_int_try_from(sw2)])));
+        return Ok((0, u16::from_be_bytes([safe_int_try_from(sw1), safe_int_try_from(sw2)]), false));
     }
     evo_incr(&mut ssc);
     let result = evo_sm_unwrap(&resp, key, &ssc, out);
     wipe(&mut resp);
     wipe(&mut rbuf);
-    result.map_err(|(e, reason)| log3ifr_ret!(ctx,f,line!(), reason, e))
+    result.map(|(len, sw)| (len, sw, true)).map_err(|(e, reason)| log3ifr_ret!(ctx,f,line!(), reason, e))
 }
 
 /// The SM data field of a command: the data object (`97 01 le` without data, plain `81` or encrypted `87`) and the
 /// `8E` MAC. `iv` is the incremented challenge (the IV for the command data). Encrypted data always gets ISO
-/// padding (indicator 01), also when its length is a multiple of the block size. A length is one byte: the
-/// callers keep each data object below 128 bytes, or at most 224 bytes of data where that was tested.
+/// padding (indicator 01), also when its length is a multiple of the block size. A length is one byte, as in the
+/// card's responses (`87 FE ..`); the callers send at most `EVO_SM_MAX_CHUNK` bytes, so it fits. Tested with a real
+/// ACOS5-EVO card up to the length byte `71` (`87 71`, PUT KEY with 96 bytes encrypted); longer command data objects
+/// were not tested.
 fn evo_sm_wrap(key: &[u8; 3*DES_KEY_SZ], iv: &[u8; AES_BLOCK_SIZE], cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8)
     -> Vec<u8>
 {
@@ -1400,7 +1408,9 @@ fn evo_sm_wrap(key: &[u8; 3*DES_KEY_SZ], iv: &[u8; AES_BLOCK_SIZE], cmd: [u8; 4]
         dos.extend_from_slice(&[0x97, 1, le]);
     }
     else if encrypt {
-        let mut padded = data.to_vec();
+        /* with room for the padding, so that no reallocation leaves an unwiped copy of the plain data */
+        let mut padded = Vec::with_capacity(data.len() + AES_BLOCK_SIZE);
+        padded.extend_from_slice(data);
         padded.push(0x80);
         while !padded.len().is_multiple_of(AES_BLOCK_SIZE) { padded.push(0); }
         let enc = aes_cbc_nopad(&padded, key, iv, Encrypt);
@@ -1534,7 +1544,7 @@ pub(crate) fn evo_sm_pin_cmd(card: &mut sc_card, data: &mut sc_pin_cmd_data, tri
     let cmd = [0, ins, 0, safe_int_try_from(data.pin_reference)];
     let result = evo_sm_transmit_sw(card, cmd, &pin_data[..pin_len], encrypt, 0, &mut dummy);
     wipe(&mut pin_data);
-    let (_, sw) = result.map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
+    let (_, sw, _) = result.map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
     let mut rv = map_inner_sw(sw, tries_left);
     data.pin1.tries_left = *tries_left;
     if rv == SC_ERROR_CARD_CMD_FAILED {
@@ -1597,7 +1607,7 @@ mod tests_evo_sm {
 
     #[test]
     fn decipher_always_plain() {
-        /* the card refuses every SM form of PSO DECIPHER and accepts it in plain on key EFs whose SCB asks for SM:
+        /* the card accepts PSO DECIPHER in plain on key EFs whose SCB asks for SM and no SM form is known to work:
            no mode sends it under SM, and transmit does not refuse it (it sends no secret) */
         for mode in [SmMode::None, SmMode::Acl, SmMode::Transmit] {
             for (scb, has_ct) in [(0x00, false), (0x01, false), (0x42, true), (0x45, false), (0x46, true)] {
@@ -1630,7 +1640,8 @@ mod tests_evo_sm {
 
     #[test]
     fn wrap_matches_reference() {
-        /* vectors from tools/evo_sm.py (EvoSM.wrap), which was tested with a real ACOS5-EVO card */
+        /* vectors computed with tools/evo_sm.py (EvoSM.wrap), an independent implementation of the same rules;
+           the vectors themselves were not sent to a card */
         let key = test_key();
         let mut iv = test_challenge();
         evo_incr(&mut iv);
@@ -1647,6 +1658,26 @@ mod tests_evo_sm {
     }
 
     fn hex(v: &[u8]) -> String { v.iter().map(|b| format!("{b:02x}")).collect() }
+
+    #[test]
+    fn mac_over_16_byte_data_object_field() {
+        /* a data object field of exactly 16 bytes is MACed without padding: the card's response MAC over
+           81 0A <10 bytes> 99 02 90 00 matched this rule (tested with a real ACOS5-EVO card, READ BINARY Le 0A).
+           Same vectors as in tools/tests/test_evo_sm.py. */
+        let key = test_key();
+        let mut iv = test_challenge();
+        evo_incr(&mut iv);
+        let mut resp = vec![0x81, 0x0A];
+        resp.extend_from_slice(b"EVO SM MAC");
+        resp.extend_from_slice(&[0x99, 0x02, 0x90, 0x00, 0x8E, 0x04, 0x47, 0x80, 0x27, 0xEA]);
+        let mut out = [0_u8; 16];
+        assert_eq!(evo_sm_unwrap(&resp, &key, &iv, &mut out).map_err(|e| e.0), Ok((10, 0x9000)));
+        assert_eq!(&out[..10], b"EVO SM MAC");
+        /* command side: 81 0E <14 bytes> is 16 bytes, no padding before the MAC */
+        let data: Vec<u8> = (0..14).collect();
+        assert_eq!(hex(&evo_sm_wrap(&key, &iv, [0x00, 0x2A, 0x9E, 0x9A], &data, false, 0)),
+                   "810e000102030405060708090a0b0c0d8e046572a54c");
+    }
 
     #[test]
     fn response_split_across_two_87_objects() {
