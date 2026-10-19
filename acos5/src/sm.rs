@@ -40,14 +40,16 @@ use std::cmp::min;
 use function_name::named;
 use opensc_sys::opensc::{sc_context, sc_card, sc_hex_to_bin, sc_transmit_apdu,
                          sc_check_sw, sc_pin_cmd_data, SC_PIN_STATE_LOGGED_IN, SC_PIN_STATE_LOGGED_OUT,
-                         SC_PIN_CMD_VERIFY, SC_PIN_CMD_CHANGE, SC_PIN_CMD_UNBLOCK};
+                         SC_PIN_CMD_VERIFY, SC_PIN_CMD_CHANGE, SC_PIN_CMD_UNBLOCK, SC_PIN_CMD_GET_INFO,
+                         SC_PIN_CMD_NEED_PADDING, sc_pin_cmd_pin, sc_build_pin};
 #[cfg(not(target_os = "windows"))]
 use opensc_sys::opensc::sc_select_file;
 use opensc_sys::types::{SC_APDU_CASE_4_SHORT, sc_aid, sc_path};
 use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_SM_KEYSET_NOT_FOUND, SC_ERROR_UNKNOWN_DATA_RECEIVED, SC_ERROR_INVALID_DATA,
                          SC_ERROR_SM_IFD_DATA_MISSING, SC_ERROR_SM_AUTHENTICATION_FAILED,
                          SC_ERROR_SM_NOT_INITIALIZED, SC_ERROR_SM, SC_ERROR_PIN_CODE_INCORRECT, SC_ERROR_AUTH_METHOD_BLOCKED,
-                         SC_ERROR_KEYPAD_MSG_TOO_LONG, SC_ERROR_SECURITY_STATUS_NOT_SATISFIED};
+                         SC_ERROR_KEYPAD_MSG_TOO_LONG, SC_ERROR_SECURITY_STATUS_NOT_SATISFIED,
+                         SC_ERROR_CARD_CMD_FAILED, SC_ERROR_NO_CARD_SUPPORT, SC_ERROR_INVALID_ARGUMENTS};
     /*, SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_NOT_SUPPORTED*/
 use opensc_sys::sm::{sm_info, SM_SMALL_CHALLENGE_LEN, SM_CMD_FILE_READ, SM_CMD_FILE_UPDATE, SM_CMD_PIN};
     /*, sm_cwa_session, SM_CMD_PIN_VERIFY, SM_CMD_FILE_CREATE, SM_CMD_FILE_DELETE, SM_CMD_FILE,*/
@@ -1208,7 +1210,7 @@ pub(crate) enum SmUse { Plain, Mac, MacEnc }
 
 /// The ACOS5-EVO commands that can be sent under secure messaging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "the PIN, key and crypto commands are not sent under SM yet"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "the key and crypto commands are not sent under SM yet"))]
 pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey, GenerateKey, Sign, Decipher, GetKey }
 
 /// Decide whether a command is sent under SM, from the configured `mode`, the command's SCB and whether the
@@ -1295,6 +1297,21 @@ fn evo_sm_key(card: &mut sc_card) -> Result<[u8; 3*DES_KEY_SZ], i32> {
 fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
     -> Result<usize, i32>
 {
+    let (len, sw) = evo_sm_transmit_sw(card, cmd, data, encrypt, le, out)?;
+    let [sw1, sw2] = sw.to_be_bytes();
+    let rv = unsafe { sc_check_sw(card, u32::from(sw1), u32::from(sw2)) };
+    if rv != SC_SUCCESS {
+        let ctx = unsafe { &mut *card.ctx };
+        return Err(log3ifr_ret!(ctx, c"evo_sm_transmit", line!(), rv));
+    }
+    Ok(len)
+}
+
+/// As `evo_sm_transmit`, but returns the status word with the response length instead of checking it: the
+/// inner SW from the 99 object, or the outer SW if the card answered without SM.
+fn evo_sm_transmit_sw(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
+    -> Result<(usize, u16), i32>
+{
     let mut key = evo_sm_key(card)?;
     let result = evo_sm_transmit_key(card, &key, cmd, data, encrypt, le, out);
     wipe(&mut key);
@@ -1302,7 +1319,7 @@ fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool,
 }
 
 fn evo_sm_transmit_key(card: &mut sc_card, key: &[u8; 3*DES_KEY_SZ], cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8,
-                       out: &mut [u8]) -> Result<usize, i32>
+                       out: &mut [u8]) -> Result<(usize, u16), i32>
 {
     if card.ctx.is_null() { return Err(SC_ERROR_SM); }
     let ctx = unsafe { &mut *card.ctx };
@@ -1345,8 +1362,9 @@ fn evo_sm_transmit_key(card: &mut sc_card, key: &[u8; 3*DES_KEY_SZ], cmd: [u8; 4
     let mut rbuf = [0_u8; 256];
     let mut apdu = build_apdu(ctx, &sm_cmd, SC_APDU_CASE_4_SHORT, &mut rbuf);
     rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };  if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
-    rv = unsafe { sc_check_sw(card, apdu.sw1, apdu.sw2) };
-    if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
+    if (apdu.sw1, apdu.sw2) != (0x90, 0) {
+        return Ok((0, u16::from_be_bytes([safe_int_try_from(apdu.sw1), safe_int_try_from(apdu.sw2)])));
+    }
 
     let resp = &rbuf[..apdu.resplen];
     if resp.len() < 10 || resp[resp.len()-6..resp.len()-4] != [0x8E, 4] {
@@ -1387,9 +1405,78 @@ fn evo_sm_transmit_key(card: &mut sc_card, key: &[u8; 3*DES_KEY_SZ], cmd: [u8; 4
         i += 2 + len;
     }
     let Some((sw1, sw2)) = inner_sw else { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); };
-    rv = unsafe { sc_check_sw(card, u32::from(sw1), u32::from(sw2)) };
-    if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
-    Ok(plain_len)
+    Ok((plain_len, u16::from_be_bytes([sw1, sw2])))
+}
+
+/// Map the status word of a PIN command: `90 00` success, `63 Cx` wrong PIN with x tries left (also set in
+/// `tries_left`), `69 83` blocked (`tries_left` 0). Any other SW gives `SC_ERROR_CARD_CMD_FAILED`.
+fn map_inner_sw(sw: u16, tries_left: &mut i32) -> i32 {
+    match sw {
+        0x9000 => SC_SUCCESS,
+        0x63C0..=0x63CF => { *tries_left = i32::from(sw & 0x0F); SC_ERROR_PIN_CODE_INCORRECT },
+        0x6983 => { *tries_left = 0; SC_ERROR_AUTH_METHOD_BLOCKED },
+        _ => SC_ERROR_CARD_CMD_FAILED,
+    }
+}
+
+/// VERIFY, CHANGE REFERENCE DATA, RESET RETRY COUNTER or the retry counter query (VERIFY without data, sent
+/// as `97 01 00`) on an ACOS5-EVO under SM. `encrypt`: PIN data as 87 (SE record has a CT) instead of 81.
+/// Sets `tries_left` (and `pin1.tries_left`) from a `63 Cx` answer; for the query, `63 Cx` is success.
+///
+/// # Errors
+/// As `evo_sm_transmit`; `SC_ERROR_PIN_CODE_INCORRECT`, `SC_ERROR_AUTH_METHOD_BLOCKED` or the mapped SW if
+/// the card refuses the command.
+pub(crate) fn evo_sm_pin_cmd(card: &mut sc_card, data: &mut sc_pin_cmd_data, tries_left: &mut i32, encrypt: bool)
+    -> Result<i32, i32>
+{
+    if card.ctx.is_null() { return Err(SC_ERROR_SM); }
+    let ctx = unsafe { &mut *card.ctx };
+    let f = c"evo_sm_pin_cmd";
+    log3if!(ctx,f,line!(), c"called for cmd: %u", data.cmd);
+    let ins = match data.cmd {
+        SC_PIN_CMD_GET_INFO | SC_PIN_CMD_VERIFY => 0x20,
+        SC_PIN_CMD_CHANGE  => 0x24,
+        SC_PIN_CMD_UNBLOCK => 0x2C,
+        _ => return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_NO_CARD_SUPPORT)),
+    };
+    /* PIN data encoded and padded as the plain ISO command would send it */
+    let mut pin_data = [0_u8; 64];
+    let mut pin_len = 0_usize;
+    if data.cmd != SC_PIN_CMD_GET_INFO {
+        let pad = i32::from((data.flags & SC_PIN_CMD_NEED_PADDING) != 0);
+        let pins: &mut [&mut sc_pin_cmd_pin] = if ins == 0x20 { &mut [&mut data.pin1] }
+                                               else { &mut [&mut data.pin1, &mut data.pin2] };
+        for pin in pins {
+            let buf = &mut pin_data[pin_len..];
+            let rv = unsafe { sc_build_pin(buf.as_mut_ptr(), buf.len(), &raw mut **pin, pad) };
+            if rv <= 0 {
+                wipe(&mut pin_data);
+                return Err(log3ifr_ret!(ctx,f,line!(), if rv < 0 { rv } else { SC_ERROR_INVALID_ARGUMENTS }));
+            }
+            pin_len += safe_int_try_from::<i32, usize>(rv);
+        }
+    }
+    data.pin1.tries_left = -1;
+    *tries_left = -1;
+    let mut dummy = [0_u8; 0];
+    let cmd = [0, ins, 0, safe_int_try_from(data.pin_reference)];
+    let result = evo_sm_transmit_sw(card, cmd, &pin_data[..pin_len], encrypt, 0, &mut dummy);
+    wipe(&mut pin_data);
+    let (_, sw) = result.map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
+    let mut rv = map_inner_sw(sw, tries_left);
+    data.pin1.tries_left = *tries_left;
+    if rv == SC_ERROR_CARD_CMD_FAILED {
+        let [sw1, sw2] = sw.to_be_bytes();
+        rv = unsafe { sc_check_sw(card, u32::from(sw1), u32::from(sw2)) };
+    }
+    if data.cmd == SC_PIN_CMD_GET_INFO && rv == SC_ERROR_PIN_CODE_INCORRECT {
+        data.pin1.logged_in = SC_PIN_STATE_LOGGED_OUT;
+        rv = SC_SUCCESS;
+    }
+    else {
+        data.pin1.logged_in = if rv == SC_SUCCESS { SC_PIN_STATE_LOGGED_IN } else { SC_PIN_STATE_LOGGED_OUT };
+    }
+    if rv == SC_SUCCESS { Ok(log3ifr_ret!(ctx,f,line!(), rv)) } else { Err(log3ifr_ret!(ctx,f,line!(), rv)) }
 }
 
 /* key EFs (FDB 09, 19) are read with GET KEY 80 CA, other files with READ BINARY / READ RECORD */
@@ -1428,7 +1515,20 @@ fn evo_sm_common_update(card: &mut sc_card, idx: u16, buf: &[u8], flags: c_ulong
 mod tests_evo_sm {
     use opensc_sys::errors::SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
     use crate::sm_config::SmMode;
-    use super::{evo_incr, evo_pad, evo_unpad, evo_sm_use, SmCmd, SmUse};
+    use opensc_sys::errors::{SC_ERROR_AUTH_METHOD_BLOCKED, SC_ERROR_PIN_CODE_INCORRECT, SC_SUCCESS};
+    use super::{evo_incr, evo_pad, evo_unpad, evo_sm_use, map_inner_sw, SmCmd, SmUse};
+
+    #[test]
+    fn pin_inner_sw_maps_tries_left() {
+        let mut tries_left = -1;
+        assert_eq!(SC_ERROR_PIN_CODE_INCORRECT, map_inner_sw(0x63C2, &mut tries_left));
+        assert_eq!(2, tries_left);
+        assert_eq!(SC_ERROR_AUTH_METHOD_BLOCKED, map_inner_sw(0x6983, &mut tries_left));
+        assert_eq!(0, tries_left);
+        tries_left = -1;
+        assert_eq!(SC_SUCCESS, map_inner_sw(0x9000, &mut tries_left));
+        assert_eq!(-1, tries_left);
+    }
 
     #[test]
     fn evo_sm_use_table() {

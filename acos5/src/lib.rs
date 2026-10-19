@@ -534,7 +534,7 @@ mod se;
 use se::{map_scb8_to_acl, se_get_is_scb_suitable_for_sm_has_ct, se_parse_sae, se_get_sae_scb};
 
 mod sm;
-use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy, SmCmd, SmUse};
+use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy, evo_sm_pin_cmd, SmCmd, SmUse};
 
 mod sm_config;
 use sm_config::{evo_sm_config_free, evo_sm_note_df_name};
@@ -2804,6 +2804,40 @@ extern "C" fn construct_fci(card_ptr: *mut sc_card, file_ref_ptr: *const sc_file
     acos5_construct_fci(card, ctx, file_ref, out_ptr, outlen).unwrap_or_else(|err| err)
 }
 
+/// ACOS5-EVO: a PIN command (`ins` 20 for VERIFY and the retry counter query, 24, 2C) in plain or under SM, as
+/// the DF's security attributes expanded and the configured SM mode decide (`evo_file_sm_use`).
+fn evo_pin_cmd(card: &mut sc_card, ctx: &mut sc_context, pin_cmd_data: &mut sc_pin_cmd_data, tries_left_ptr: *mut i32,
+               ins: u8, cmd: SmCmd) -> Result<i32, i32>
+{
+    let f = c"evo_pin_cmd";
+    let mut dummy_tries_left: i32 = -1;
+    let tries_left = if tries_left_ptr.is_null() { &mut dummy_tries_left } else { unsafe { &mut *tries_left_ptr } };
+    let scb = se_get_sae_scb(card, [0, ins, 0, safe_int_try_from(pin_cmd_data.pin_reference)]);
+    if scb == 0xFF {
+        return Err(log3ifr_ret!(ctx,f,line!(), c"The PIN command won't be done: It's not allowed by SAE",
+            SC_ERROR_SECURITY_STATUS_NOT_SATISFIED));
+    }
+    let get_info = pin_cmd_data.cmd == SC_PIN_CMD_GET_INFO;
+    /* the retry counter query sends no PIN: plain unless the card requires SM for it */
+    if get_info && (scb & 0x40) == 0 {
+        return pin_get_policy(card, ctx, pin_cmd_data, tries_left);
+    }
+    let file_id = file_id_from_cache_current_path(card);
+    match evo_file_sm_use(card, file_id, scb, cmd).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))? {
+        SmUse::Plain if get_info => pin_get_policy(card, ctx, pin_cmd_data, tries_left),
+        SmUse::Plain => {
+            #[expect(clippy::expect_used, reason = "..")]
+            let func_ptr = unsafe { (*(*sc_get_iso7816_driver()).ops).pin_cmd.expect("") };
+            Ok(unsafe { func_ptr(card, pin_cmd_data, tries_left_ptr) })
+        },
+        _ if SC_AC_CHV != pin_cmd_data.pin_type => Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_INVALID_ARGUMENTS)),
+        sm_use => {
+            card.sm_ctx.info.cmd = SM_CMD_PIN;
+            evo_sm_pin_cmd(card, pin_cmd_data, tries_left, sm_use == SmUse::MacEnc)
+        },
+    }
+}
+
 /*
  * What it does
  * @apiNote
@@ -2837,6 +2871,9 @@ fn acos5_pin_cmd(card: &mut sc_card, ctx: &mut sc_context, data_ptr: *mut sc_pin
                                  unsafe { &mut *tries_left_ptr }
                              }
             )
+        }
+        else if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+            evo_pin_cmd(card, ctx, pin_cmd_data, tries_left_ptr, 0x20, SmCmd::Verify)
         }
         else {
             let file_id = file_id_from_cache_current_path(card);
@@ -2964,6 +3001,9 @@ println!();
             rv
 */
         }
+        else if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+            evo_pin_cmd(card, ctx, pin_cmd_data, tries_left_ptr, 0x20, SmCmd::Verify)
+        }
         else {
             let file_id = file_id_from_cache_current_path(card);
 //println!("file_id: {:X}", file_id);
@@ -3018,6 +3058,9 @@ println!();
             // Safety:
             unsafe { Ok(func_ptr(card, pin_cmd_data, tries_left_ptr)) }
         }
+        else if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+            evo_pin_cmd(card, ctx, pin_cmd_data, tries_left_ptr, 0x24, SmCmd::ChangePin)
+        }
         else {
             let file_id = file_id_from_cache_current_path(card);
 //println!("file_id: {:X}", file_id);
@@ -3062,10 +3105,13 @@ println!();
             // Safety:
             unsafe { Ok(func_ptr(card, pin_cmd_data, tries_left_ptr)) }
         }
+        else if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+            evo_pin_cmd(card, ctx, pin_cmd_data, tries_left_ptr, 0x2C, SmCmd::Unblock)
+        }
         else {
             let file_id = file_id_from_cache_current_path(card);
 //println!("file_id: {:X}", file_id);
-            let scb_unblock_pin = se_get_sae_scb(card, [0_u8,0x24,0,safe_int_try_from(pin_cmd_data.pin_reference)]);
+            let scb_unblock_pin = se_get_sae_scb(card, [0_u8,0x2C,0,safe_int_try_from(pin_cmd_data.pin_reference)]);
 //println!("scb_unblock_pin: {:X}", scb_unblock_pin);
 
             if scb_unblock_pin == 0xFF {
