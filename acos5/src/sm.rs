@@ -32,7 +32,7 @@ TODO There is a lot of code duplication here: Abstract as much as possible for t
 use libc::{free, strlen};
 
 use std::os::raw::{c_char, c_ulong, c_void};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 use std::slice::from_raw_parts;
 use std::time::Instant;
@@ -44,7 +44,7 @@ use opensc_sys::opensc::{sc_context, sc_card, sc_hex_to_bin, sc_transmit_apdu,
                          SC_PIN_CMD_NEED_PADDING, sc_pin_cmd_pin, sc_build_pin};
 #[cfg(not(target_os = "windows"))]
 use opensc_sys::opensc::sc_select_file;
-use opensc_sys::types::{SC_APDU_CASE_4_SHORT, sc_aid, sc_path};
+use opensc_sys::types::{SC_APDU_CASE_4_SHORT, SC_APDU_FLAGS_NO_GET_RESP, sc_aid, sc_path};
 use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_SM_KEYSET_NOT_FOUND, SC_ERROR_UNKNOWN_DATA_RECEIVED, SC_ERROR_INVALID_DATA,
                          SC_ERROR_SM_IFD_DATA_MISSING, SC_ERROR_SM_AUTHENTICATION_FAILED,
                          SC_ERROR_SM_NOT_INITIALIZED, SC_ERROR_SM, SC_ERROR_PIN_CODE_INCORRECT, SC_ERROR_AUTH_METHOD_BLOCKED,
@@ -1184,6 +1184,8 @@ use crate::crypto::{aes_cbc_nopad, aes_cmac, AES_BLOCK_SIZE};
 use opensc_sys::types::SC_APDU_CASE_2_SHORT;
 
 const EVO_SM_MAX_CHUNK: usize = 224; // keeps padded SM command/response data within short APDU limits
+/// The longest SM response collected with GET RESPONSE (an RSA-4096 signature with its SM objects fits).
+const EVO_SM_MAX_RESPONSE: usize = 1024;
 
 fn evo_pad(v: &mut Vec<u8>) {
     if !v.len().is_multiple_of(AES_BLOCK_SIZE) {
@@ -1211,7 +1213,7 @@ pub(crate) enum SmUse { Plain, Mac, MacEnc }
 /// The ACOS5-EVO commands that can be sent under secure messaging. `PinStatus` is the retry counter query
 /// (VERIFY without data): it sends no PIN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "the key and crypto commands are not sent under SM yet"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "PUT KEY is not sent under SM yet"))]
 pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey, GenerateKey, Sign, Decipher, GetKey,
                         PinStatus }
 
@@ -1226,10 +1228,14 @@ pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey
 ///   material never go in plain, neither as a plain APDU nor in a MAC-only `81` object. The card accepts only
 ///   the form its access condition dictates, so no command is forced into SM or into encryption.
 ///
+/// PSO DECIPHER is always plain: the card refused every SM form tried, and it accepts the plain form on key EFs
+/// whose use condition asks for SM (tested with a real ACOS5-EVO card).
+///
 /// # Errors
 /// `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` for mode `none` with an SCB that requires SM, and for mode
 /// `transmit` with a PIN or key command whose SCB does not require SM with encryption.
 pub(crate) fn evo_sm_use(mode: SmMode, scb: u8, has_ct: bool, cmd: SmCmd) -> Result<SmUse, i32> {
+    if cmd == SmCmd::Decipher { return Ok(SmUse::Plain); }
     let required = scb != 0xFF && (scb & 0x40) == 0x40;
     let by_se = if has_ct { SmUse::MacEnc } else { SmUse::Mac };
     let secret = matches!(cmd, SmCmd::Verify | SmCmd::ChangePin | SmCmd::Unblock | SmCmd::PutKey);
@@ -1297,7 +1303,7 @@ fn evo_sm_key(card: &mut sc_card) -> Result<[u8; 3*DES_KEY_SZ], i32> {
 /// `data`: command data (empty: the command expects `le` response bytes).
 /// `encrypt`: command data as 87 (SE record has a CT) instead of plain 81.
 /// Returns the number of plain response bytes written to `out`.
-fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
+pub(crate) fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
     -> Result<usize, i32>
 {
     let (len, sw) = evo_sm_transmit_sw(card, cmd, data, encrypt, le, out)?;
@@ -1312,7 +1318,7 @@ fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool,
 
 /// As `evo_sm_transmit`, but returns the status word with the response length instead of checking it: the
 /// inner SW from the 99 object, or the outer SW if the card answered without SM.
-fn evo_sm_transmit_sw(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
+pub(crate) fn evo_sm_transmit_sw(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
     -> Result<(usize, u16), i32>
 {
     let mut key = evo_sm_key(card)?;
@@ -1335,80 +1341,128 @@ fn evo_sm_transmit_key(card: &mut sc_card, key: &[u8; 3*DES_KEY_SZ], cmd: [u8; 4
     if rv != SC_SUCCESS || apdu.resplen != AES_BLOCK_SIZE { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
     evo_incr(&mut ssc);
 
-    let cla = cmd[0] ^ 0x0C;
-    let mut dos = Vec::with_capacity(data.len() + 20);
+    let dos = evo_sm_wrap(key, &ssc, cmd, data, encrypt, le);
+    let mut sm_cmd = vec![cmd[0] ^ 0x0C, cmd[1], cmd[2], cmd[3], safe_int_try_from(dos.len())];
+    sm_cmd.extend_from_slice(&dos);
+    sm_cmd.push(0);
+    /* the response is collected here with GET RESPONSE (61 XX under T=0): it may be longer than 256 bytes */
+    let mut rbuf = [0_u8; 256];
+    let mut apdu = build_apdu(ctx, &sm_cmd, SC_APDU_CASE_4_SHORT, &mut rbuf);
+    apdu.flags |= SC_APDU_FLAGS_NO_GET_RESP;
+    rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };  if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
+    let mut resp = rbuf[..apdu.resplen].to_vec();
+    let (mut sw1, mut sw2) = (apdu.sw1, apdu.sw2);
+    while sw1 == 0x61 {
+        let n = if sw2 == 0 { 256 } else { safe_int_try_from::<u32, usize>(sw2) };
+        if resp.len() + n > EVO_SM_MAX_RESPONSE {
+            return Err(log3ifr_ret!(ctx,f,line!(), c"Error: SM response too long", SC_ERROR_SM));
+        }
+        let mut gr = build_apdu(ctx, &[0, 0xC0, 0, 0, safe_int_try_from(sw2)], SC_APDU_CASE_2_SHORT, &mut rbuf[..n]);
+        gr.flags |= SC_APDU_FLAGS_NO_GET_RESP;
+        rv = unsafe { sc_transmit_apdu(card, &raw mut gr) };  if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
+        resp.extend_from_slice(&rbuf[..gr.resplen]);
+        (sw1, sw2) = (gr.sw1, gr.sw2);
+    }
+    if (sw1, sw2) != (0x90, 0) {
+        return Ok((0, u16::from_be_bytes([safe_int_try_from(sw1), safe_int_try_from(sw2)])));
+    }
+    evo_incr(&mut ssc);
+    let result = evo_sm_unwrap(&resp, key, &ssc, out);
+    wipe(&mut resp);
+    wipe(&mut rbuf);
+    result.map_err(|(e, reason)| log3ifr_ret!(ctx,f,line!(), reason, e))
+}
+
+/// The SM data field of a command: the data object (`97 01 le` without data, plain `81` or encrypted `87`) and the
+/// `8E` MAC. `iv` is the incremented challenge (the IV for the command data). Encrypted data always gets ISO
+/// padding (indicator 01), also when its length is a multiple of the block size. A length is one byte: the
+/// callers keep each data object below 128 bytes, or at most 224 bytes of data where that was tested.
+fn evo_sm_wrap(key: &[u8; 3*DES_KEY_SZ], iv: &[u8; AES_BLOCK_SIZE], cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8)
+    -> Vec<u8>
+{
+    let mut dos = Vec::with_capacity(data.len() + 30);
     if data.is_empty() {
         dos.extend_from_slice(&[0x97, 1, le]);
     }
     else if encrypt {
         let mut padded = data.to_vec();
-        evo_pad(&mut padded);
-        let pi = u8::from(padded.len() != data.len());
-        let enc = aes_cbc_nopad(&padded, key, &ssc, Encrypt);
-        dos.extend_from_slice(&[0x87, safe_int_try_from(enc.len() + 1), pi]);
+        padded.push(0x80);
+        while !padded.len().is_multiple_of(AES_BLOCK_SIZE) { padded.push(0); }
+        let enc = aes_cbc_nopad(&padded, key, iv, Encrypt);
+        wipe(&mut padded);
+        dos.extend_from_slice(&[0x87, safe_int_try_from(enc.len() + 1), 1]);
         dos.extend_from_slice(&enc);
     }
     else {
         dos.extend_from_slice(&[0x81, safe_int_try_from(data.len())]);
         dos.extend_from_slice(data);
     }
-    let mut mac_in = vec![0x89, 4, cla, cmd[1], cmd[2], cmd[3]];
+    let mut mac_in = vec![0x89, 4, cmd[0] ^ 0x0C, cmd[1], cmd[2], cmd[3]];
     evo_pad(&mut mac_in);
     let mut dos_padded = dos.clone();
     evo_pad(&mut dos_padded);
     mac_in.extend_from_slice(&dos_padded);
+    wipe(&mut dos_padded);
     let mac = aes_cmac(&mac_in, key);
+    wipe(&mut mac_in);
+    dos.extend_from_slice(&[0x8E, 4, mac[0], mac[1], mac[2], mac[3]]);
+    dos
+}
 
-    let mut sm_cmd = vec![cla, cmd[1], cmd[2], cmd[3], safe_int_try_from(dos.len() + 6)];
-    sm_cmd.extend_from_slice(&dos);
-    sm_cmd.extend_from_slice(&[0x8E, 4, mac[0], mac[1], mac[2], mac[3], 0]);
-    let mut rbuf = [0_u8; 256];
-    let mut apdu = build_apdu(ctx, &sm_cmd, SC_APDU_CASE_4_SHORT, &mut rbuf);
-    rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };  if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
-    if (apdu.sw1, apdu.sw2) != (0x90, 0) {
-        return Ok((0, u16::from_be_bytes([safe_int_try_from(apdu.sw1), safe_int_try_from(apdu.sw2)])));
-    }
-
-    let resp = &rbuf[..apdu.resplen];
+/// Check an SM response (all bytes the card sent before SW `90 00`) and copy its plain data to `out`.
+/// `iv` is the IV for the response data (challenge + 2). The MAC is checked over the whole response first.
+/// Data can come in several `81` or `87` objects in a row: an RSA-2048 signature comes as `87 FE 00 <253 bytes>`
+/// and `87 04 00 <3 bytes>`, one CBC ciphertext, which is joined and decrypted once with the padding indicator of
+/// the last object. The card codes each length in one byte, also above `7F`. An inner `61 XX` with data counts as
+/// `90 00`, as in the plain form. Returns the data length and the inner SW.
+fn evo_sm_unwrap(resp: &[u8], key: &[u8; 3*DES_KEY_SZ], iv: &[u8; AES_BLOCK_SIZE], out: &mut [u8])
+    -> Result<(usize, u16), (i32, &'static CStr)>
+{
     if resp.len() < 10 || resp[resp.len()-6..resp.len()-4] != [0x8E, 4] {
-        return Err(log3ifr_ret!(ctx,f,line!(), c"Error: SM response without MAC", SC_ERROR_SM));
+        return Err((SC_ERROR_SM, c"Error: SM response without MAC"));
     }
     let body = &resp[..resp.len()-6];
     let mut body_padded = body.to_vec();
     evo_pad(&mut body_padded);
-    if aes_cmac(&body_padded, key)[..4] != resp[resp.len()-4..] {
-        return Err(log3ifr_ret!(ctx,f,line!(), c"Error: SM response MAC mismatch", SC_ERROR_SM));
+    let mac = aes_cmac(&body_padded, key);
+    wipe(&mut body_padded);
+    if mac[..4] != resp[resp.len()-4..] {
+        return Err((SC_ERROR_SM, c"Error: SM response MAC mismatch"));
     }
-    evo_incr(&mut ssc);
 
-    let mut plain_len = 0_usize;
-    let mut inner_sw: Option<(u8, u8)> = None;
+    let (mut plain, mut cipher, mut indicator, mut inner_sw) = (Vec::new(), Vec::new(), 0_u8, None);
     let mut i = 0_usize;
     while i + 2 <= body.len() {
         let (tag, len) = (body[i], usize::from(body[i+1]));
-        if i + 2 + len > body.len() { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
+        if i + 2 + len > body.len() { return Err((SC_ERROR_SM, c"Error: SM response object too long")); }
         let val = &body[i+2..i+2+len];
         match tag {
-            0x81 => {
-                if val.len() > out.len() { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
-                out[..val.len()].copy_from_slice(val);
-                plain_len = val.len();
-            },
-            0x87 => {
-                if val.is_empty() || !(val.len()-1).is_multiple_of(AES_BLOCK_SIZE) { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
-                let dec = aes_cbc_nopad(&val[1..], key, &ssc, Decrypt);
-                let plain = if val[0] == 1 { evo_unpad(&dec).ok_or(SC_ERROR_SM)? } else { &dec[..] };
-                if plain.len() > out.len() { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
-                out[..plain.len()].copy_from_slice(plain);
-                plain_len = plain.len();
-            },
-            0x99 if len == 2 => inner_sw = Some((val[0], val[1])),
+            0x81 => plain.extend_from_slice(val),
+            0x87 if len > 0 => { indicator = val[0]; cipher.extend_from_slice(&val[1..]); },
+            0x99 if len == 2 => inner_sw = Some(u16::from_be_bytes([val[0], val[1]])),
             _ => {},
         }
         i += 2 + len;
     }
-    let Some((sw1, sw2)) = inner_sw else { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); };
-    Ok((plain_len, u16::from_be_bytes([sw1, sw2])))
+    let Some(mut sw) = inner_sw else { return Err((SC_ERROR_SM, c"Error: SM response without status word")); };
+    if !cipher.is_empty() {
+        if !plain.is_empty() || !cipher.len().is_multiple_of(AES_BLOCK_SIZE) {
+            return Err((SC_ERROR_SM, c"Error: SM response data objects malformed"));
+        }
+        let mut dec = aes_cbc_nopad(&cipher, key, iv, Decrypt);
+        let unpadded = if indicator == 1 { evo_unpad(&dec).map(<[u8]>::to_vec) } else { Some(dec.clone()) };
+        wipe(&mut dec);
+        plain = unpadded.ok_or((SC_ERROR_SM, c"Error: SM response padding"))?;
+    }
+    if plain.len() > out.len() {
+        wipe(&mut plain);
+        return Err((SC_ERROR_SM, c"Error: SM response longer than the buffer"));
+    }
+    out[..plain.len()].copy_from_slice(&plain);
+    if (sw >> 8) == 0x61 && !plain.is_empty() { sw = 0x9000; }
+    let len = plain.len();
+    wipe(&mut plain);
+    Ok((len, sw))
 }
 
 /// Map the status word of a PIN command: `90 00` success, `63 Cx` wrong PIN with x tries left (also set in
@@ -1519,7 +1573,96 @@ mod tests_evo_sm {
     use opensc_sys::errors::SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
     use crate::sm_config::SmMode;
     use opensc_sys::errors::{SC_ERROR_AUTH_METHOD_BLOCKED, SC_ERROR_PIN_CODE_INCORRECT, SC_SUCCESS};
-    use super::{evo_incr, evo_pad, evo_unpad, evo_sm_use, map_inner_sw, SmCmd, SmUse};
+    use super::{evo_incr, evo_pad, evo_unpad, evo_sm_use, evo_sm_wrap, evo_sm_unwrap, map_inner_sw, SmCmd, SmUse};
+    use crate::crypto::{aes_cbc_nopad, aes_cmac, Encrypt};
+
+    /* fixed test vector, not a card key (as tools/tests/test_evo_sm.py) */
+    fn test_key() -> [u8; 24] { core::array::from_fn(|i| u8::try_from(i).unwrap_or(0)) }
+    fn test_challenge() -> [u8; 16] { core::array::from_fn(|i| u8::try_from(16 + i).unwrap_or(0)) }
+
+    #[test]
+    fn decipher_always_plain() {
+        /* the card refuses every SM form of PSO DECIPHER and accepts it in plain on key EFs whose SCB asks for SM:
+           no mode sends it under SM, and transmit does not refuse it (it sends no secret) */
+        for mode in [SmMode::None, SmMode::Acl, SmMode::Transmit] {
+            for (scb, has_ct) in [(0x00, false), (0x01, false), (0x42, true), (0x45, false), (0x46, true)] {
+                assert_eq!(evo_sm_use(mode, scb, has_ct, SmCmd::Decipher), Ok(SmUse::Plain), "mode {mode:?}, SCB {scb:02X}");
+            }
+        }
+    }
+
+    #[test]
+    fn bound_key_sm_use() {
+        use SmUse::{Mac as M, MacEnc as E};
+        const ERR: Result<SmUse, i32> = Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED);
+        /* +bound key EFs: SCB 42 = SE #2 (user PIN, CCT and CT) for the private key EF's use and update and the
+           public key EF's update; SCB 45 = SE #5 (CCT only) for the public key EF's read */
+        let rows: [(SmMode, u8, bool, [Result<SmUse, i32>; 4]); 6] = [
+            //                           Sign   GenKey GetKey PutKey
+            (SmMode::Acl,      0x42, true,  [Ok(E), Ok(E), Ok(E), Ok(E)]),
+            (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M)]),
+            (SmMode::Transmit, 0x42, true,  [Ok(E), Ok(E), Ok(E), Ok(E)]),
+            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), Ok(M), ERR  ]),
+            (SmMode::None,     0x42, true,  [ERR,   ERR,   ERR,   ERR  ]),
+            (SmMode::None,     0x45, false, [ERR,   ERR,   ERR,   ERR  ]),
+        ];
+        for (mode, scb, has_ct, expected) in rows {
+            for (cmd, want) in [SmCmd::Sign, SmCmd::GenerateKey, SmCmd::GetKey, SmCmd::PutKey].into_iter().zip(expected) {
+                assert_eq!(evo_sm_use(mode, scb, has_ct, cmd), want, "mode {mode:?}, SCB {scb:02X}, {cmd:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_matches_reference() {
+        /* vectors from tools/evo_sm.py (EvoSM.wrap), which was tested with a real ACOS5-EVO card */
+        let key = test_key();
+        let mut iv = test_challenge();
+        evo_incr(&mut iv);
+        /* PUT KEY, 96 bytes (a multiple of the block size) encrypted: ISO padding is still added, indicator 01 */
+        let data: Vec<u8> = (0..96).collect();
+        let want = "877101b8deab50e64bf32e0fb15c3d3040a2c9f554b2eca6ea341d4092be8c5b357a159c3f4a94cf8bd339b8e8516657b5\
+                    060416f4771d128513943301e6c1859d2f85500063692dd9823fdb351dd77ab2da7e036b69818dfa73c31ab7de9f548c32\
+                    0a2ce9fe2982d3c1a9bb3585a3e45b41d98e04f19cbf81";
+        assert_eq!(hex(&evo_sm_wrap(&key, &iv, [0x80, 0xDA, 0x00, 0x05], &data, true, 0)), want);
+        /* PSO COMPUTE DIGITAL SIGNATURE, 32 byte hash, MAC only */
+        let data: Vec<u8> = (0..32).collect();
+        let want = "8120000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f8e0400bf74b0";
+        assert_eq!(hex(&evo_sm_wrap(&key, &iv, [0x00, 0x2A, 0x9E, 0x9A], &data, false, 0)), want);
+    }
+
+    fn hex(v: &[u8]) -> String { v.iter().map(|b| format!("{b:02x}")).collect() }
+
+    #[test]
+    fn response_split_across_two_87_objects() {
+        /* as the card sends an RSA-2048 signature: 87 FE 00 <253 bytes> 87 04 00 <3 bytes>, one CBC ciphertext
+           (padding indicator 00), short-form length FE, inner SW 61 00 although the whole signature is there */
+        let key = test_key();
+        let mut iv = test_challenge();
+        evo_incr(&mut iv);
+        evo_incr(&mut iv);
+        let reply: Vec<u8> = (0..256_u16).map(|i| u8::try_from(i % 253).unwrap_or(0)).collect();
+        let enc = aes_cbc_nopad(&reply, &key, &iv, Encrypt);
+        let mut resp = vec![0x87, 0xFE, 0x00];
+        resp.extend_from_slice(&enc[..253]);
+        resp.extend_from_slice(&[0x87, 0x04, 0x00]);
+        resp.extend_from_slice(&enc[253..]);
+        resp.extend_from_slice(&[0x99, 0x02, 0x61, 0x00]);
+        let mut mac_in = resp.clone();
+        evo_pad(&mut mac_in);
+        let mac = aes_cmac(&mac_in, &key);
+        resp.extend_from_slice(&[0x8E, 0x04, mac[0], mac[1], mac[2], mac[3]]);
+
+        let mut out = [0_u8; 512];
+        assert_eq!(evo_sm_unwrap(&resp, &key, &iv, &mut out).map_err(|e| e.0), Ok((256, 0x9000)));
+        assert_eq!(&out[..256], &reply[..]);
+        /* the MAC covers the whole response */
+        let mut bad = resp.clone();
+        bad[100] ^= 1;
+        assert!(evo_sm_unwrap(&bad, &key, &iv, &mut out).is_err());
+        /* an output buffer too small for the joined data */
+        assert!(evo_sm_unwrap(&resp, &key, &iv, &mut out[..255]).is_err());
+    }
 
     #[test]
     fn pin_inner_sw_maps_tries_left() {
@@ -1545,16 +1688,16 @@ mod tests_evo_sm {
             //                           Read   Update Verify ChgPin Unblk  PutKey GenKey Sign   Decip  GetKey PinSt
             (SmMode::None,     0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
             (SmMode::None,     0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::None,     0x45, false, [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
-            (SmMode::None,     0x46, true,  [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
+            (SmMode::None,     0x45, false, [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   Ok(P), ERR,   ERR  ]),
+            (SmMode::None,     0x46, true,  [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   Ok(P), ERR,   ERR  ]),
             (SmMode::Acl,      0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
             (SmMode::Acl,      0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M)]),
-            (SmMode::Acl,      0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
+            (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(P), Ok(M), Ok(M)]),
+            (SmMode::Acl,      0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(P), Ok(E), Ok(E)]),
             (SmMode::Transmit, 0x00, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
             (SmMode::Transmit, 0x01, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), ERR,   ERR,   ERR,   ERR,   Ok(M), Ok(M), Ok(M), Ok(M), Ok(M)]),
-            (SmMode::Transmit, 0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
+            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), ERR,   ERR,   ERR,   ERR,   Ok(M), Ok(M), Ok(P), Ok(M), Ok(M)]),
+            (SmMode::Transmit, 0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(P), Ok(E), Ok(E)]),
         ];
         for (mode, scb, has_ct, expected) in rows {
             for (cmd, want) in CMDS.into_iter().zip(expected) {

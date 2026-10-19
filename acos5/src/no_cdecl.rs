@@ -90,13 +90,14 @@ use crate::constants_types::{ATR_MASK, ATR_V2, ATR_V3, BLOCKCIPHER_PAD_TYPE_ANSI
                              file_id_from_path_value, file_id_se,
                              CRT_TAG_HT, CRT_TAG_CCT, CRT_TAG_DST, CRT_TAG_CT,
                              SC_SEC_OPERATION_GENERATE_ECCPRIVATE, SC_SEC_OPERATION_GENERATE_ECCPUBLIC,
-                             prev_multiple_of, safe_int_try_from
+                             prev_multiple_of, safe_int_try_from, CRYPTO
 };
 use crate::se::{se_parse_sac, se_get_is_scb_suitable_for_sm_has_ct};
 use crate::path::{cut_path, file_id_from_cache_current_path, current_path_df, is_impossible_file_match};
 //use crate::missing_exports::me_get_max_recv_size;
 //use crate::cmd_card_info::is_pin_authenticated;
-use crate::sm::{SM_SMALL_CHALLENGE_LEN_u8, sm_common_read, sm_common_update, evo_sm_decide, SmCmd, SmUse};
+use crate::sm::{SM_SMALL_CHALLENGE_LEN_u8, sm_common_read, sm_common_update, evo_sm_decide, evo_sm_transmit,
+                SmCmd, SmUse};
 use crate::crypto::{RAND_bytes, des_ecb3_unpadded_8, Encrypt};
 
 //use super::acos5_process_fci;/*, acos5_list_files, acos5_select_file, acos5_set_security_env*/
@@ -1623,10 +1624,27 @@ pub(crate) fn generate_asym(card: &mut sc_card, data: &mut CardCtlGenerateAsymCr
         }
     }
 
+    /* ACOS5-EVO: under SM if the private key EF's use condition asks for it; the data go in 81 (MAC only), the
+       form tested with a real ACOS5-EVO card (RSA; the card refuses SM for EC key generation) */
+    let sm_use = if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+        match evo_key_sm_use(card, data.file_id_priv, CRYPTO, SmCmd::GenerateKey) {
+            Ok(sm_use) => sm_use,
+            Err(e) => return log3ifr_ret!(ctx,f,line!(), e),
+        }
+    } else { SmUse::Plain };
+
     if data.key_curve_code==0 {
         let mut command = [0_u8, 0x46, 0,0,18, data.key_len_code, data.key_priv_type_code, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
         if data.do_generate_with_standard_rsa_pub_exponent { command[4] = 2; }
         else { command[7..23].copy_from_slice(&data.rsa_pub_exponent); }
+        if sm_use != SmUse::Plain {
+            let lc = usize::from(command[4]);
+            rv = match evo_sm_transmit(card, [0, 0x46, 0, 0], &command[5..5+lc], false, 0, &mut []) {
+                Ok(_) => SC_SUCCESS,
+                Err(e) => e,
+            };
+            return log3ifr_ret!(ctx,f,line!(), rv);
+        }
         let mut apdu = build_apdu(ctx, &command[.. command.len() - if data.do_generate_with_standard_rsa_pub_exponent {16} else {0}], SC_APDU_CASE_3_SHORT, &mut[]);
 //log3if!(ctx,f,line!(), c"%s", unsafe {sc_dump_hex(command.as_ptr(), 7)});
         rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };  if rv != SC_SUCCESS { return log3ifr_ret!(ctx,f,line!(), rv); }
@@ -2531,6 +2549,26 @@ pub(crate) fn evo_file_sm_use(card: &mut sc_card, file_id: u16, scb: u8, cmd: Sm
             c"The file's SM access condition references an SE record unusable for SM", SC_ERROR_SECURITY_STATUS_NOT_SATISFIED));
     }
     evo_sm_decide(card, scb, has_ct, cmd)
+}
+
+/// ACOS5-EVO: how a command on key EF `file_id` is sent, decided by its SCB at `scb_idx` (`CRYPTO`, `UPDATE`)
+/// with `evo_file_sm_use`. The SCBs are known once the key EF was selected with its FCI; until then the SCB
+/// counts as `00` (no SM), which mode `transmit` refuses for PUT KEY.
+///
+/// # Errors
+/// As `evo_file_sm_use`.
+pub(crate) fn evo_key_sm_use(card: &mut sc_card, file_id: u16, scb_idx: usize, cmd: SmCmd) -> Result<SmUse, i32>
+{
+    let scb = {
+        let dp = unsafe { &*card.drv_data.cast::<DataPrivate>() };
+        dp.files.get(&file_id).and_then(|x| x.2).map(|scb8| scb8[scb_idx])
+    };
+    let scb = scb.unwrap_or_else(|| {
+        let ctx = unsafe { &mut *card.ctx };
+        log3if!(ctx, c"evo_key_sm_use", line!(), c"SCBs of key EF %04X not known: no SM", u32::from(file_id));
+        0
+    });
+    evo_file_sm_use(card, file_id, scb, cmd)
 }
 
 

@@ -492,7 +492,7 @@ use constants_types::{BLOCKCIPHER_PAD_TYPE_ANSIX9_23, BLOCKCIPHER_PAD_TYPE_ONEAN
                       file_id_from_path_value, file_id, file_id_se, Fci,
                       SC_CARDCTL_ACOS5_ALGO_REF_SYM_STORE, CardCtlAlgoRefSymStore, CRT_TAG_DST, CRT_TAG_CT,
                       SC_SEC_OPERATION_GENERATE_ECCPRIVATE, SC_SEC_OPERATION_GENERATE_ECCPUBLIC,
-                      SC_SEC_OPERATION_ENCIPHER_ECCPUBLIC, ECPUB_MAX_LEN, safe_int_try_from
+                      SC_SEC_OPERATION_ENCIPHER_ECCPUBLIC, ECPUB_MAX_LEN, safe_int_try_from, CRYPTO
                       /*,PKCS15_FILE_TYPE_ECCPRIVATEKEY, PKCS15_FILE_TYPE_ECCPUBLICKEY, READ*/};
 
 #[cfg(iup_user_consent)]
@@ -521,7 +521,7 @@ use no_cdecl::{select_file_by_path, enum_dir,
     ACL_CATEGORY_DF_MF, ACL_CATEGORY_EF_CHV, ACL_CATEGORY_KEY, ACL_CATEGORY_SE,
     get_is_running_compute_signature, set_is_running_compute_signature, algo_ref_sym_store,
     common_read, common_update, acos5_supported_ec_curves, logout_pin, sym_en_decrypt,
-    algo_ref_mse_sedo, evo_file_sm_use
+    algo_ref_mse_sedo, evo_file_sm_use, evo_key_sm_use
 };
 
 mod path;
@@ -534,7 +534,8 @@ mod se;
 use se::{map_scb8_to_acl, se_get_is_scb_suitable_for_sm_has_ct, se_parse_sae, se_get_sae_scb};
 
 mod sm;
-use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy, evo_sm_pin_cmd, SmCmd, SmUse};
+use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy, evo_sm_pin_cmd, evo_sm_transmit,
+         SmCmd, SmUse};
 
 mod sm_config;
 use sm_config::{evo_sm_config_free, evo_sm_note_df_name};
@@ -3999,6 +4000,19 @@ digest_info.len(), digest_info[..15]==digest_algorithm_sha1[..], digest_info[..1
 
         // SHA-1 and SHA-256 hashes, what the card can handle natively; EVO can handle more digest algos natively
         let hash = &digest_info[if digest_info.len()==35 {15} else {19} ..];
+        /* ACOS5-EVO: under SM if the key EF's use condition asks for it; the hash goes in 81 (MAC only), the form
+           tested with a real ACOS5-EVO card; the signature comes back encrypted when the SE record has a CT */
+        if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+            let file_ref = get_sec_env(card).file_ref;
+            if file_ref.len >= 2 {
+                let fid = u16::from_be_bytes([file_ref.value[file_ref.len-2], file_ref.value[file_ref.len-1]]);
+                if evo_key_sm_use(card, fid, CRYPTO, SmCmd::Sign).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))? != SmUse::Plain {
+                    let n = evo_sm_transmit(card, [0, 0x2A, 0x9E, 0x9A], hash, false, 0, out)
+                        .map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
+                    return Ok(log3ifr_ret!(ctx,f,line!(), safe_int_try_from::<usize,i32>(n)));
+                }
+            }
+        }
         set_is_running_cmd_long_response(card, true); // switch to false is done by acos5_get_response
         /* */
 println!("hash.len(): {}", hash.len());
