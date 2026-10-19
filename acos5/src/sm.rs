@@ -1208,10 +1208,12 @@ fn evo_incr(b: &mut [u8; AES_BLOCK_SIZE]) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SmUse { Plain, Mac, MacEnc }
 
-/// The ACOS5-EVO commands that can be sent under secure messaging.
+/// The ACOS5-EVO commands that can be sent under secure messaging. `PinStatus` is the retry counter query
+/// (VERIFY without data): it sends no PIN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), expect(dead_code, reason = "the key and crypto commands are not sent under SM yet"))]
-pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey, GenerateKey, Sign, Decipher, GetKey }
+pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey, GenerateKey, Sign, Decipher, GetKey,
+                        PinStatus }
 
 /// Decide whether a command is sent under SM, from the configured `mode`, the command's SCB and whether the
 /// SE record the SCB references has a CT (`has_ct`).
@@ -1220,12 +1222,13 @@ pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey
 /// * `none`: never SM; an SCB that requires SM is an error.
 /// * `acl`: SM only where the SCB requires it, encrypted if the SE record has a CT.
 /// * `transmit` (strict): as `acl`, but a PIN or key command (VERIFY, CHANGE REFERENCE DATA, RESET RETRY
-///   COUNTER, PUT KEY) whose SCB does not require SM is refused, so PINs and key material never go in plain.
-///   The card accepts SM only where the access condition requires it, so no command is forced into SM.
+///   COUNTER, PUT KEY) is refused unless its SCB requires SM with an SE record that has a CT, so PINs and key
+///   material never go in plain, neither as a plain APDU nor in a MAC-only `81` object. The card accepts only
+///   the form its access condition dictates, so no command is forced into SM or into encryption.
 ///
 /// # Errors
 /// `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` for mode `none` with an SCB that requires SM, and for mode
-/// `transmit` with a PIN or key command whose SCB does not require SM.
+/// `transmit` with a PIN or key command whose SCB does not require SM with encryption.
 pub(crate) fn evo_sm_use(mode: SmMode, scb: u8, has_ct: bool, cmd: SmCmd) -> Result<SmUse, i32> {
     let required = scb != 0xFF && (scb & 0x40) == 0x40;
     let by_se = if has_ct { SmUse::MacEnc } else { SmUse::Mac };
@@ -1233,8 +1236,8 @@ pub(crate) fn evo_sm_use(mode: SmMode, scb: u8, has_ct: bool, cmd: SmCmd) -> Res
     match mode {
         SmMode::None => if required { Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED) } else { Ok(SmUse::Plain) },
         SmMode::Acl => Ok(if required { by_se } else { SmUse::Plain }),
-        SmMode::Transmit => if required { Ok(by_se) }
-                            else if secret { Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED) }
+        SmMode::Transmit => if secret && !(required && has_ct) { Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED) }
+                            else if required { Ok(by_se) }
                             else { Ok(SmUse::Plain) },
     }
 }
@@ -1265,7 +1268,7 @@ pub(crate) fn evo_sm_decide(card: &mut sc_card, scb: u8, has_ct: bool, cmd: SmCm
     let serial_c = CString::new(config.serial_hex()).unwrap_or_default();
     match evo_sm_use(config.mode, scb, has_ct, cmd) {
         Err(e) if config.mode == SmMode::Transmit => {
-            log3if!(ctx,f,line!(), c"secure_messaging: card %s: mode transmit refused a plain PIN or key command",
+            log3if!(ctx,f,line!(), c"secure_messaging: card %s: mode transmit refused a PIN or key command without encryption",
                 serial_c.as_ptr());
             Err(e)
         },
@@ -1533,24 +1536,25 @@ mod tests_evo_sm {
     #[test]
     fn evo_sm_use_table() {
         use SmUse::{Plain as P, Mac as M, MacEnc as E};
-        const CMDS: [SmCmd; 10] = [SmCmd::ReadFile, SmCmd::UpdateFile, SmCmd::Verify, SmCmd::ChangePin, SmCmd::Unblock,
-                                   SmCmd::PutKey, SmCmd::GenerateKey, SmCmd::Sign, SmCmd::Decipher, SmCmd::GetKey];
+        const CMDS: [SmCmd; 11] = [SmCmd::ReadFile, SmCmd::UpdateFile, SmCmd::Verify, SmCmd::ChangePin, SmCmd::Unblock,
+                                   SmCmd::PutKey, SmCmd::GenerateKey, SmCmd::Sign, SmCmd::Decipher, SmCmd::GetKey,
+                                   SmCmd::PinStatus];
         const ERR: Result<SmUse, i32> = Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED);
         /* SCB 45: SE record 5 (CCT only), SCB 46: SE record 6 (CCT and CT) */
-        let rows: [(SmMode, u8, bool, [Result<SmUse, i32>; 10]); 12] = [
-            //                           Read   Update Verify ChgPin Unblk  PutKey GenKey Sign   Decip  GetKey
-            (SmMode::None,     0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::None,     0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::None,     0x45, false, [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
-            (SmMode::None,     0x46, true,  [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
-            (SmMode::Acl,      0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::Acl,      0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M)]),
-            (SmMode::Acl,      0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
-            (SmMode::Transmit, 0x00, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::Transmit, 0x01, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M)]),
-            (SmMode::Transmit, 0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
+        let rows: [(SmMode, u8, bool, [Result<SmUse, i32>; 11]); 12] = [
+            //                           Read   Update Verify ChgPin Unblk  PutKey GenKey Sign   Decip  GetKey PinSt
+            (SmMode::None,     0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::None,     0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::None,     0x45, false, [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
+            (SmMode::None,     0x46, true,  [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
+            (SmMode::Acl,      0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::Acl,      0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M)]),
+            (SmMode::Acl,      0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
+            (SmMode::Transmit, 0x00, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::Transmit, 0x01, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), ERR,   ERR,   ERR,   ERR,   Ok(M), Ok(M), Ok(M), Ok(M), Ok(M)]),
+            (SmMode::Transmit, 0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
         ];
         for (mode, scb, has_ct, expected) in rows {
             for (cmd, want) in CMDS.into_iter().zip(expected) {
@@ -1560,6 +1564,16 @@ mod tests_evo_sm {
         /* SCB FF is NEVER, not SM with SE record 0F: no SM decision error for it */
         assert_eq!(evo_sm_use(SmMode::None, 0xFF, false, SmCmd::ReadFile), Ok(P));
         assert_eq!(evo_sm_use(SmMode::Transmit, 0xFF, false, SmCmd::Verify), ERR);
+    }
+
+    #[test]
+    fn transmit_pin_status_not_secret() {
+        /* the retry counter query sends no PIN: allowed in plain and MAC-only in mode transmit */
+        assert_eq!(evo_sm_use(SmMode::Transmit, 0x45, false, SmCmd::PinStatus), Ok(SmUse::Mac));
+        assert_eq!(evo_sm_use(SmMode::Transmit, 0x01, false, SmCmd::PinStatus), Ok(SmUse::Plain));
+        assert_eq!(evo_sm_use(SmMode::Transmit, 0x46, true, SmCmd::PinStatus), Ok(SmUse::MacEnc));
+        /* VERIFY with the same MAC-only SE record is refused */
+        assert_eq!(evo_sm_use(SmMode::Transmit, 0x45, false, SmCmd::Verify), Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED));
     }
 
     #[test]

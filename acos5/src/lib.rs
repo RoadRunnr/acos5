@@ -2818,10 +2818,6 @@ fn evo_pin_cmd(card: &mut sc_card, ctx: &mut sc_context, pin_cmd_data: &mut sc_p
             SC_ERROR_SECURITY_STATUS_NOT_SATISFIED));
     }
     let get_info = pin_cmd_data.cmd == SC_PIN_CMD_GET_INFO;
-    /* the retry counter query sends no PIN: plain unless the card requires SM for it */
-    if get_info && (scb & 0x40) == 0 {
-        return pin_get_policy(card, ctx, pin_cmd_data, tries_left);
-    }
     let file_id = file_id_from_cache_current_path(card);
     match evo_file_sm_use(card, file_id, scb, cmd).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))? {
         SmUse::Plain if get_info => pin_get_policy(card, ctx, pin_cmd_data, tries_left),
@@ -2873,7 +2869,7 @@ fn acos5_pin_cmd(card: &mut sc_card, ctx: &mut sc_context, data_ptr: *mut sc_pin
             )
         }
         else if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
-            evo_pin_cmd(card, ctx, pin_cmd_data, tries_left_ptr, 0x20, SmCmd::Verify)
+            evo_pin_cmd(card, ctx, pin_cmd_data, tries_left_ptr, 0x20, SmCmd::PinStatus)
         }
         else {
             let file_id = file_id_from_cache_current_path(card);
