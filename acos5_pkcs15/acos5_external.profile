@@ -292,13 +292,14 @@ filesystem {
 }
 
 # ACOS5-EVO, RSA keys only: pkcs15-init --profile acos5_external+bound ...
-# The key EF pair gets access conditions that ask for SM, so the driver uses SM for this key's GENERATE KEY PAIR,
-# PUT KEY, GET KEY and PSO COMPUTE DIGITAL SIGNATURE (SCB 0x42 = SE record 2: user PIN and SM with MAC and
-# encryption; SCB 0x45 = SE record 5: SM MAC). PSO DECIPHER stays plain.
-# Private key EF: CRYPTO and UPDATE need SE record 2, READ never (SAC 01 FF 01 01 42 42 FF).
-# Public key EF: UPDATE needs SE record 2, READ SE record 5 (SAC 01 FF 01 01 01 42 45).
-# Needs SM keys for the card (evo_init.py --sm). It does not keep a host without the SM keys from using the key:
-# the card does not enforce SM conditions on key EFs. Binding the card to hosts is evo_init.py --bind.
+# The key EF pair gets access conditions that require the user PIN and SM, so the driver uses SM for this key's
+# GENERATE KEY PAIR, PUT KEY, GET KEY, PSO COMPUTE DIGITAL SIGNATURE and PSO DECIPHER. SCB 0xC2 = SE record 2 (user
+# PIN, SM with MAC and encryption) with bit 7 set: every condition of the record must be met, so the card refuses
+# the key in plain and under SM without a verified PIN. SCB 0x45 = SE record 5: SM MAC.
+# Private key EF: CRYPTO and UPDATE need SE record 2 in full, READ never (SAC 01 FF 01 01 C2 C2 FF).
+# Public key EF: UPDATE needs SE record 2 in full, READ SE record 5 (SAC 01 FF 01 01 01 C2 45).
+# Needs SM keys for the card (evo_init.py --sm). A host without the SM keys cannot use, replace or generate the key.
+# Binding the PIN commands and the PKCS#15 files to hosts is evo_init.py --bind.
 # Each ACL starts from *=NEVER: an entry added to an op that already has an SCB would only be appended.
 option bound {
     filesystem {
@@ -306,14 +307,14 @@ option bound {
             DF PKCS15-AppDF {
                 EF template-private-key {
                     ACL = *=NEVER, DELETE-SELF=SCB1, REHABILITATE=SCB1, INVALIDATE=SCB1,
-                          CRYPTO=SCB0x42, UPDATE=SCB0x42;
+                          CRYPTO=SCB0xC2, UPDATE=SCB0xC2;
                 }
                 EF template-public-key {
                     file-id   = 00D0;
                     type      = 9;
                     structure = transparent;
                     ACL = *=NEVER, DELETE-SELF=SCB1, REHABILITATE=SCB1, INVALIDATE=SCB1,
-                          CRYPTO=SCB1, UPDATE=SCB0x42, READ=SCB0x45;
+                          CRYPTO=SCB1, UPDATE=SCB0xC2, READ=SCB0x45;
                 }
             }
         }
