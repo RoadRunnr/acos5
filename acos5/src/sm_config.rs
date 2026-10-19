@@ -25,8 +25,9 @@ resolve, the keyset entries are skipped, and the settings resolve again once the
 */
 
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::os::raw::{c_char, c_void};
-use std::ptr::{null, null_mut};
+use std::ptr::{null, null_mut, write_volatile};
 
 use libc::free;
 use opensc_sys::opensc::{sc_card, sc_context, sc_select_file, sc_get_mf_path};
@@ -74,7 +75,7 @@ impl KeySource {
 /* overwrite in a way the compiler cannot drop as a dead store */
 pub(crate) fn wipe(buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        unsafe { std::ptr::write_volatile(b, 0) };
+        unsafe { write_volatile(b, 0) };
     }
 }
 
@@ -86,8 +87,8 @@ fn wipe_string(s: String) {
 /// The static SM keys of a card: `sm` = key 82, `auth` = key 81 (both AES-192).
 #[derive(Clone)]
 pub(crate) struct EvoSmKeys {
-    pub(crate) sm: [u8; KEY_LEN],
-    pub(crate) auth: [u8; KEY_LEN],
+    pub sm: [u8; KEY_LEN],
+    pub auth: [u8; KEY_LEN],
 }
 
 impl Drop for EvoSmKeys {
@@ -97,24 +98,24 @@ impl Drop for EvoSmKeys {
     }
 }
 
-impl std::fmt::Debug for EvoSmKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for EvoSmKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("EvoSmKeys { .. }")
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct EvoSmConfig {
-    pub(crate) mode: SmMode,
-    pub(crate) keys: Option<EvoSmKeys>,
-    #[allow(dead_code)] // not used yet: the EVO SM uses the static keys
-    pub(crate) session_keys: bool,
-    pub(crate) key_source: KeySource,
-    pub(crate) serial: [u8; 8],
+    pub mode: SmMode,
+    pub keys: Option<EvoSmKeys>,
+    #[allow(dead_code, reason = "not used yet: the EVO SM uses the static keys")]
+    pub session_keys: bool,
+    pub key_source: KeySource,
+    pub serial: [u8; 8],
     /// In mode `none`: the invalid key setting that was ignored (its entry name, never the value).
-    pub(crate) ignored_setting: Option<String>,
+    pub ignored_setting: Option<String>,
     /// The AID was known, so the keyset entries were looked up.
-    pub(crate) aid_known: bool,
+    pub aid_known: bool,
 }
 
 impl EvoSmConfig {
@@ -123,7 +124,8 @@ impl EvoSmConfig {
 }
 
 fn serial_hex(serial: &[u8]) -> String {
-    serial.iter().map(|b| format!("{b:02X}")).collect()
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    serial.iter().flat_map(|b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 0x0F)]]).map(char::from).collect()
 }
 
 fn parse_mode(value: &str) -> Result<SmMode, i32> {
@@ -146,11 +148,11 @@ fn parse_bool(value: &str) -> Result<bool, i32> {
 /* hex digits, optionally separated by ':' or white space (as sc_hex_to_bin accepts them) */
 fn parse_hex(value: &str) -> Result<Vec<u8>, i32> {
     let mut digits: Vec<u8> = value.bytes().filter(|c| *c != b':' && !c.is_ascii_whitespace()).collect();
-    let result = if digits.len() % 2 == 0 && digits.iter().all(u8::is_ascii_hexdigit) {
+    let result = if digits.len().is_multiple_of(2) && digits.iter().all(u8::is_ascii_hexdigit) {
         Ok(digits.chunks_exact(2).map(|p| {
             let hi = char::from(p[0]).to_digit(16).unwrap_or(0);
             let lo = char::from(p[1]).to_digit(16).unwrap_or(0);
-            u8::try_from(hi << 4 | lo).unwrap_or(0)
+            u8::try_from((hi << 4) | lo).unwrap_or(0)
         }).collect())
     }
     else { Err(SC_ERROR_INVALID_DATA) };
@@ -164,12 +166,12 @@ fn parse_key(value: String, allow_raw: bool) -> Result<[u8; KEY_LEN], i32> {
                     else { parse_hex(&value) };
     wipe_string(value);
     let mut key = [0_u8; KEY_LEN];
-    let result = match bytes {
-        Ok(ref b) if b.len() == KEY_LEN => { key.copy_from_slice(b); Ok(key) },
+    let result = match bytes.as_ref() {
+        Ok(b) if b.len() == KEY_LEN => { key.copy_from_slice(b); Ok(key) },
         Ok(_) => Err(SC_ERROR_INVALID_DATA),
-        Err(e) => Err(e),
+        Err(e) => Err(*e),
     };
-    if let Ok(ref mut b) = bytes { wipe(b); }
+    if let Ok(b) = bytes.as_mut() { wipe(b); }
     wipe(&mut key);
     result
 }
@@ -197,14 +199,14 @@ fn keyset(get: &dyn Fn(&str) -> Option<String>, aid: &[u8], allow_raw: bool) -> 
     }
 }
 
-fn keys_from_kmc(value: String, serial: &[u8; 8]) -> Result<EvoSmKeys, i32> {
+fn keys_from_kmc(value: String, serial: [u8; 8]) -> Result<EvoSmKeys, i32> {
     let mut kmc = parse_hex(&value);
     wipe_string(value);
-    let result = match kmc {
-        Ok(ref k) if k.len() == KMC_LEN => {
+    let result = match kmc.as_ref() {
+        Ok(k) if k.len() == KMC_LEN => {
             let mut keys = EvoSmKeys { sm: [0; KEY_LEN], auth: [0; KEY_LEN] };
-            let mut sm = kbkdf_cmac(k, LABEL_SM, serial, KEY_LEN);
-            let mut auth = kbkdf_cmac(k, LABEL_AUTH, serial, KEY_LEN);
+            let mut sm = kbkdf_cmac(k, LABEL_SM, &serial, KEY_LEN);
+            let mut auth = kbkdf_cmac(k, LABEL_AUTH, &serial, KEY_LEN);
             keys.sm.copy_from_slice(&sm);
             keys.auth.copy_from_slice(&auth);
             wipe(&mut sm);
@@ -212,9 +214,9 @@ fn keys_from_kmc(value: String, serial: &[u8; 8]) -> Result<EvoSmKeys, i32> {
             Ok(keys)
         },
         Ok(_) => Err(SC_ERROR_INVALID_DATA),
-        Err(e) => Err(e),
+        Err(e) => Err(*e),
     };
-    if let Ok(ref mut k) = kmc { wipe(k); }
+    if let Ok(k) = kmc.as_mut() { wipe(k); }
     result
 }
 
@@ -230,10 +232,10 @@ fn keys_from_kmc(value: String, serial: &[u8; 8]) -> Result<EvoSmKeys, i32> {
 /// No keys is not an error: `keys` is `None` then. In mode `none` an invalid key setting is not an error
 /// either: `keys` is `None` and `ignored_setting` names the entry.
 /// An empty `aid` is not an error: the keyset entries, which are named after the AID, are skipped.
-pub(crate) fn resolve(lookup: &dyn Fn(Option<&str>, &str) -> Option<String>, serial: &[u8; 8], aid: &[u8],
+pub(crate) fn resolve(lookup: &dyn Fn(Option<&str>, &str) -> Option<String>, serial: [u8; 8], aid: &[u8],
                       legacy: &dyn Fn(&str) -> Option<String>) -> Result<EvoSmConfig, i32>
 {
-    let serial_hex = serial_hex(serial);
+    let serial_hex = serial_hex(&serial);
     let card = |key: &str| lookup(Some(&serial_hex), key);
     let setting = |key: &str| card(key).or_else(|| lookup(None, key));
     let aid_known = !aid.is_empty();
@@ -271,11 +273,11 @@ pub(crate) fn resolve(lookup: &dyn Fn(Option<&str>, &str) -> Option<String>, ser
     let mode_for = |source: KeySource| mode.unwrap_or(if source == KeySource::Legacy { SmMode::Acl } else { SmMode::None });
     match found {
         Ok((keys, key_source)) =>
-            Ok(EvoSmConfig { mode: mode_for(key_source), keys, session_keys, key_source, serial: *serial, ignored_setting: None,
+            Ok(EvoSmConfig { mode: mode_for(key_source), keys, session_keys, key_source, serial, ignored_setting: None,
                              aid_known }),
         /* mode none never uses keys, so an invalid key setting is only reported */
         Err(((_, entry), source)) if mode_for(source) == SmMode::None =>
-            Ok(EvoSmConfig { mode: SmMode::None, keys: None, session_keys, key_source: KeySource::None, serial: *serial,
+            Ok(EvoSmConfig { mode: SmMode::None, keys: None, session_keys, key_source: KeySource::None, serial,
                              ignored_setting: Some(entry), aid_known }),
         Err(((e, _), _)) => Err(e),
     }
@@ -335,10 +337,10 @@ pub(crate) fn evo_sm_config(card: &mut sc_card) -> Result<EvoSmConfig, i32> {
 
     let drv_block = find_block(ctx, c"card_driver", CARD_DRV_SHORT_NAME.as_ptr());
     let sm_name = get_str(drv_block, "secure_messaging");
-    let (sm_block, card_block) = match sm_name {
+    let (sm_block, card_block) = match sm_name.as_deref() {
         None => (null_mut(), null_mut()),
-        Some(ref name) => {
-            let name_c = CString::new(name.as_str()).map_err(|_e| SC_ERROR_INVALID_ARGUMENTS)?;
+        Some(name) => {
+            let name_c = CString::new(name).map_err(|_e| SC_ERROR_INVALID_ARGUMENTS)?;
             let sm_block = find_block(ctx, c"secure_messaging", name_c.as_ptr());
             if sm_block.is_null() {
                 log3if!(ctx,f,line!(), c"secure_messaging: no block named %s", name_c.as_ptr());
@@ -354,7 +356,7 @@ pub(crate) fn evo_sm_config(card: &mut sc_card) -> Result<EvoSmConfig, i32> {
     let lookup = |serial: Option<&str>, key: &str| get_str(if serial.is_some() { card_block } else { sm_block }, key);
     let legacy = |key: &str| if sm_name.is_none() { get_str(drv_block, key) } else { None };
 
-    let config = resolve(&lookup, &serial, aid, &legacy).map_err(|e| {
+    let config = resolve(&lookup, serial, aid, &legacy).map_err(|e| {
         let serial_c = CString::new(serial_hex(&serial)).unwrap_or_default();
         log3if!(ctx,f,line!(), c"secure_messaging: invalid setting for card %s", serial_c.as_ptr());
         log3ifr_ret!(ctx,f,line!(), e)
@@ -366,8 +368,8 @@ pub(crate) fn evo_sm_config(card: &mut sc_card) -> Result<EvoSmConfig, i32> {
     if !config.aid_known {
         log3if!(ctx,f,line!(), c"secure_messaging: AID not known yet, keyset entries skipped");
     }
-    if let Some(ref entry) = config.ignored_setting {
-        let entry_c = CString::new(entry.as_str()).unwrap_or_default();
+    if let Some(entry) = config.ignored_setting.as_deref() {
+        let entry_c = CString::new(entry).unwrap_or_default();
         log3if!(ctx,f,line!(), c"secure_messaging: mode none, ignoring the invalid setting %s", entry_c.as_ptr());
     }
     if config.key_source == KeySource::Legacy {
@@ -392,11 +394,11 @@ pub(crate) fn evo_sm_note_df_name(card: &mut sc_card, file: &sc_file) {
 
 /* The path of a DF entry of `DataPrivate::files` (fid, path, file info), if it is an EVO DF below the MF whose
    path enum_dir has filled in (`info[1]` is the path length then; list_files leaves the path zero). */
-fn df_path<'a>(fid: u16, path: &'a [u8; SC_MAX_PATH_SIZE], info: &[u8; 8]) -> Option<&'a [u8]> {
+fn df_path(fid: u16, path: &[u8; SC_MAX_PATH_SIZE], info: [u8; 8]) -> Option<&[u8]> {
     let len = usize::from(info[1]);
     let filled = info[0] == FDB_DF && (4..=SC_MAX_PATH_SIZE).contains(&len) && len.is_multiple_of(2)
         && path[..2] == [0x3F, 0] && path[len-2..len] == fid.to_be_bytes();
-    if filled { Some(&path[..len]) } else { None }
+    filled.then(|| &path[..len])
 }
 
 /// Find the AID without reading any file: SELECT the known DFs until one returns a DF name, then SELECT the
@@ -418,7 +420,7 @@ pub(crate) fn evo_sm_find_aid(card: &mut sc_card) -> Result<bool, i32> {
                  { card.cache.current_path }
             _ => { dp.card_cache.current_path }
         };
-        let mut dfs: Vec<Vec<u8>> = dp.files.iter().filter_map(|(fid, v)| df_path(*fid, &v.0, &v.1).map(<[u8]>::to_vec))
+        let mut dfs: Vec<Vec<u8>> = dp.files.iter().filter_map(|(fid, v)| df_path(*fid, &v.0, v.1).map(<[u8]>::to_vec))
             .collect();
         dfs.sort_unstable();
         (curr_path, dfs)
@@ -487,11 +489,11 @@ mod tests {
         fn resolve_aid(&self, aid: &[u8]) -> (Result<EvoSmConfig, i32>, Vec<String>) {
             let asked = RefCell::new(Vec::new());
             let lookup = |serial: Option<&str>, key: &str| {
-                asked.borrow_mut().push(key.to_string());
+                asked.borrow_mut().push(key.to_owned());
                 self.main.get(&(serial.map(String::from), key.into())).cloned()
             };
-            let legacy = |key: &str| { asked.borrow_mut().push(key.to_string()); self.legacy.get(key).cloned() };
-            let result = resolve(&lookup, &SERIAL, aid, &legacy);
+            let legacy = |key: &str| { asked.borrow_mut().push(key.to_owned()); self.legacy.get(key).cloned() };
+            let result = resolve(&lookup, SERIAL, aid, &legacy);
             (result, asked.into_inner())
         }
     }
@@ -637,14 +639,14 @@ mod tests {
         let mut path = [0_u8; 16];
         path[..4].copy_from_slice(&[0x3F, 0, 0x41, 0]);
         /* after enum_dir: FDB 38, path length 4 */
-        assert_eq!(df_path(0x4100, &path, &[0x38, 4, 0x41, 0, 0, 0, 0, 0]), Some(&[0x3F_u8, 0, 0x41, 0][..]));
+        assert_eq!(df_path(0x4100, &path, [0x38, 4, 0x41, 0, 0, 0, 0, 0]), Some(&[0x3F_u8, 0, 0x41, 0][..]));
         /* from list_files only: path zero, DCB in byte 1 */
-        assert_eq!(df_path(0x4100, &[0; 16], &[0x38, 0, 0x41, 0, 0, 0, 0, 0]), None);
-        assert_eq!(df_path(0x4100, &[0; 16], &[0x38, 4, 0x41, 0, 0, 0, 0, 0]), None);
+        assert_eq!(df_path(0x4100, &[0; 16], [0x38, 0, 0x41, 0, 0, 0, 0, 0]), None);
+        assert_eq!(df_path(0x4100, &[0; 16], [0x38, 4, 0x41, 0, 0, 0, 0, 0]), None);
         /* not a DF, the MF, or a path that does not end in the fid */
-        assert_eq!(df_path(0x4100, &path, &[0x01, 4, 0x41, 0, 0, 0, 0, 0]), None);
-        assert_eq!(df_path(0x3F00, &path, &[0x3F, 2, 0x3F, 0, 0, 0, 0, 0]), None);
-        assert_eq!(df_path(0x4200, &path, &[0x38, 4, 0x42, 0, 0, 0, 0, 0]), None);
+        assert_eq!(df_path(0x4100, &path, [0x01, 4, 0x41, 0, 0, 0, 0, 0]), None);
+        assert_eq!(df_path(0x3F00, &path, [0x3F, 2, 0x3F, 0, 0, 0, 0, 0]), None);
+        assert_eq!(df_path(0x4200, &path, [0x38, 4, 0x42, 0, 0, 0, 0, 0]), None);
     }
 
     #[test]

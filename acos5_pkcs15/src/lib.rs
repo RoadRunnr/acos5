@@ -1031,7 +1031,9 @@ fn bound_check(card: &mut sc_card, key_type: u32) -> i32 {
     let rv = unsafe { sc_card_ctl(card, SC_CARDCTL_ACOS5_EVO_SM_KEYS, (&raw mut keys).cast::<c_void>()) };
     if rv != SC_SUCCESS { return rv; }
     if !keys.has_keys {
-        let serial: String = keys.serial.iter().map(|b| format!("{b:02X}")).collect();
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let serial: String = keys.serial.iter().flat_map(|b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 0x0F)]])
+            .map(char::from).collect();
         let serial = CString::new(serial).unwrap_or_default();
         log3if!(ctx,f,line!(), c"+bound needs SM keys for card %s", serial.as_ptr());
         return SC_ERROR_SM_KEYSET_NOT_FOUND;
@@ -1227,7 +1229,7 @@ fn acos5_put_key(card: &mut sc_card, offset: usize, data: &[u8]) -> i32 {
         let mut apdu = build_apdu(ctx, &cmd, SC_APDU_CASE_3_SHORT, &mut []);
         let rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };
         if rv != SC_SUCCESS { return rv; }
-        if !(apdu.sw1 == 0x90 && apdu.sw2 == 0x00) && !(apdu.sw1 == 0x63 && apdu.sw2 == 0x01) {
+        if ![(0x90, 0x00), (0x63, 0x01)].contains(&(apdu.sw1, apdu.sw2)) {
             return SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
         }
         pos = end;

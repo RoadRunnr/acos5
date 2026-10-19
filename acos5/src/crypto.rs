@@ -498,7 +498,7 @@ pub(crate) fn aes_cbc_nopad(data: &[u8], key: &[u8], iv: &[u8; AES_BLOCK_SIZE], 
 fn cmac_subkey_double(block: &[u8; AES_BLOCK_SIZE]) -> [u8; AES_BLOCK_SIZE] {
     let mut out = [0_u8; AES_BLOCK_SIZE];
     for i in 0..AES_BLOCK_SIZE {
-        out[i] = block[i] << 1 | if i + 1 < AES_BLOCK_SIZE { block[i + 1] >> 7 } else { 0 };
+        out[i] = (block[i] << 1) | if i + 1 < AES_BLOCK_SIZE { block[i + 1] >> 7 } else { 0 };
     }
     if block[0] & 0x80 != 0 { out[AES_BLOCK_SIZE - 1] ^= 0x87; }
     out
@@ -541,6 +541,7 @@ pub(crate) fn aes_cmac(data: &[u8], key: &[u8]) -> [u8; AES_BLOCK_SIZE] {
    CMAC(kmc, i || label || 00 || context || L), L = out_len in bits (2 bytes, big-endian). */
 #[must_use]
 pub(crate) fn kbkdf_cmac(kmc: &[u8], label: &[u8], context: &[u8], out_len: usize) -> Vec<u8> {
+    #[expect(clippy::expect_used, reason = "callers ask for one key, far below 8 KB")]
     let bits = u16::try_from(out_len * 8).expect("KDF output too long");
     let mut fixed = label.to_vec();
     fixed.push(0);
@@ -650,7 +651,7 @@ mod tests_ec_point {
         // P-256 base point G, compressed: 03 || Gx (Gy is odd)
         let gx = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
         let gy = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
-        let h = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect::<Vec<u8>>();
+        let h = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i+2).unwrap(), 16).unwrap()).collect::<Vec<u8>>();
         let mut comp = vec![3_u8]; comp.extend(h(gx));
         let mut unc = vec![4_u8]; unc.extend(h(gx)); unc.extend(h(gy));
         assert_eq!(Some(unc), ec_point_uncompress(2, &comp));

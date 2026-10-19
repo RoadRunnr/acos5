@@ -2836,7 +2836,7 @@ fn evo_pin_cmd(card: &mut sc_card, ctx: &mut sc_context, pin_cmd_data: &mut sc_p
             Ok(unsafe { func_ptr(card, pin_cmd_data, tries_left_ptr) })
         },
         _ if SC_AC_CHV != pin_cmd_data.pin_type => Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_INVALID_ARGUMENTS)),
-        sm_use => {
+        sm_use @ (SmUse::Mac | SmUse::MacEnc) => {
             card.sm_ctx.info.cmd = SM_CMD_PIN;
             evo_sm_pin_cmd(card, pin_cmd_data, tries_left, sm_use == SmUse::MacEnc)
         },
@@ -3372,13 +3372,11 @@ fn acos5_read_public_key_ec(card: &mut sc_card,
 
     /* EVO stores compressed points; OpenSC needs an uncompressed one */
     let uncompressed = if [2_u8, 3].contains(&rbuf[0]) {
-        match ec_point_uncompress(curve_indicator, &rbuf[..usize::from(point_length_readable)]) {
-            Some(v) => v,
-            None => {
-                log3if!(ctx,f,line!(), c"### failed: EC public key point is not on the curve ###");
-                return SC_ERROR_INCOMPATIBLE_KEY;
-            }
-        }
+        let Some(v) = ec_point_uncompress(curve_indicator, &rbuf[..usize::from(point_length_readable)]) else {
+            log3if!(ctx,f,line!(), c"### failed: EC public key point is not on the curve ###");
+            return SC_ERROR_INCOMPATIBLE_KEY;
+        };
+        v
     } else { rbuf[..usize::from(point_length_readable)].to_vec() };
 
     /* hand OpenSC an SPKI: unlike a bare ECPoint it carries the curve (needed for CKA_EC_PARAMS) */
@@ -4022,8 +4020,6 @@ digest_info.len(), digest_info[..15]==digest_algorithm_sha1[..], digest_info[..1
             }
         }
         set_is_running_cmd_long_response(card, true); // switch to false is done by acos5_get_response
-        /* */
-println!("hash.len(): {}", hash.len());
         // SAFETY: dereferencing a non-null pointer, received from extern "C" fn
         let iso_ops = unsafe { &*(*sc_get_iso7816_driver()).ops };
         #[expect(clippy::expect_used, reason = "..")]

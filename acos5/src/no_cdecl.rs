@@ -2471,7 +2471,7 @@ pub(crate) fn common_read(card: &mut sc_card,
         let cmd = if bin && [FDB_RSA_KEY_EF, FDB_ECC_KEY_EF].contains(&fdb) {SmCmd::GetKey} else {SmCmd::ReadFile};
         match evo_file_sm_use(card, file_id, scb_read, cmd) {
             Err(e) => Err(log3ifr_ret!(ctx,f,line!(), e)),
-            Ok(SmUse::Plain) => plain_read(card, idx, buf, flags, bin, fdb),
+            Ok(SmUse::Plain) => Ok(plain_read(card, idx, buf, flags, bin, fdb)),
             Ok(sm_use) => {
                 card.sm_ctx.info.cmd = SM_CMD_FILE_READ;
                 Ok(log3ifr_ret!(ctx,f,line!(), sm_common_read(card, idx, buf, flags, bin, sm_use == SmUse::MacEnc, fdb)))
@@ -2492,11 +2492,11 @@ pub(crate) fn common_read(card: &mut sc_card,
                     SC_ERROR_SECURITY_STATUS_NOT_SATISFIED))
         }
     }
-    else { plain_read(card, idx, buf, flags, bin, fdb) }
+    else { Ok(plain_read(card, idx, buf, flags, bin, fdb)) }
 } // common_read
 
 /* read without SM: key EFs with GET KEY, other files with READ BINARY / READ RECORD */
-fn plain_read(card: &mut sc_card, idx: u16, buf: &mut [u8], flags: c_ulong, bin: bool, fdb: u8) -> Result<i32, i32>
+fn plain_read(card: &mut sc_card, idx: u16, buf: &mut [u8], flags: c_ulong, bin: bool, fdb: u8) -> i32
 {
     let ctx = unsafe { &mut *card.ctx };
     let f = if bin {c"common_read for acos5_read_binary"} else {c"common_read for acos5_read_record"};
@@ -2507,7 +2507,7 @@ fn plain_read(card: &mut sc_card, idx: u16, buf: &mut [u8], flags: c_ulong, bin:
         let rv = unsafe { (*(*sc_get_iso7816_driver()).ops).get_data.expect("")
             (card, u32::from(idx), buf.as_mut_ptr(), buf.len()) };
         card.cla = 0;
-        Ok(log3ifr_ret!(ctx,f,line!(), rv))
+        log3ifr_ret!(ctx,f,line!(), rv)
     }
     else { unsafe { cfg_select! {
         any(v0_20_0, v0_21_0, v0_22_0, v0_23_0) => {
@@ -2524,12 +2524,12 @@ fn plain_read(card: &mut sc_card, idx: u16, buf: &mut [u8], flags: c_ulong, bin:
             #[expect(clippy::expect_used, reason = "..")]
             if bin {
                 let mut myflags: c_ulong = flags;
-                Ok(log3ifr_ret!(ctx,f,line!(), (*(*sc_get_iso7816_driver()).ops).read_binary.expect("")
-                    (card, u32::from(idx), buf.as_mut_ptr(), buf.len(), &raw mut myflags)))
+                log3ifr_ret!(ctx,f,line!(), (*(*sc_get_iso7816_driver()).ops).read_binary.expect("")
+                    (card, u32::from(idx), buf.as_mut_ptr(), buf.len(), &raw mut myflags))
             }
             else {
-                Ok(log3ifr_ret!(ctx,f,line!(), (*(*sc_get_iso7816_driver()).ops).read_record.expect("")
-                    (card, u32::from(idx), 0, buf.as_mut_ptr(), buf.len(), flags)))
+                log3ifr_ret!(ctx,f,line!(), (*(*sc_get_iso7816_driver()).ops).read_record.expect("")
+                    (card, u32::from(idx), 0, buf.as_mut_ptr(), buf.len(), flags))
             }
         }
     } } }
@@ -2571,6 +2571,13 @@ pub(crate) fn evo_key_sm_use(card: &mut sc_card, file_id: u16, scb_idx: usize, c
     evo_file_sm_use(card, file_id, scb, cmd)
 }
 
+/// Whether a PUT KEY status word counts as success: `90 00`, or `63 01` (key pair not consistent yet) when it is
+/// authentic, that is a plain command's SW or the inner SW of an SM response. Under SM, an outer `63 01` (an answer
+/// without SM wrapping and MAC) is an error.
+pub(crate) fn put_key_sw_ok(sw: u16, authentic: bool) -> bool {
+    sw == 0x9000 || (sw == 0x6301 && authentic)
+}
+
 /// `SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT`: PUT KEY `80 DA P1 P2` (P1 P2 = offset) into the selected key EF, in plain or
 /// under SM as the key EF's UPDATE SCB decides (`SmCmd::PutKey`: mode `transmit` refuses it in plain). The data are
 /// split into commands of up to 255 bytes in plain and 96 bytes under SM (each `87` object stays below 128 bytes),
@@ -2579,13 +2586,6 @@ pub(crate) fn evo_key_sm_use(card: &mut sc_card, file_id: u16, scb_idx: usize, c
 ///
 /// # Errors
 /// As `evo_key_sm_use` and `evo_sm_transmit_sw`; the mapped SW if the card refuses a command.
-/// Whether a PUT KEY status word counts as success: `90 00`, or `63 01` (key pair not consistent yet) when it is
-/// authentic, that is a plain command's SW or the inner SW of an SM response. Under SM, an outer `63 01` (an answer
-/// without SM wrapping and MAC) is an error.
-pub(crate) fn put_key_sw_ok(sw: u16, authentic: bool) -> bool {
-    sw == 0x9000 || (sw == 0x6301 && authentic)
-}
-
 pub(crate) fn evo_put_key(card: &mut sc_card, ctl: &mut CardCtlEvoSmTransmit) -> Result<i32, i32>
 {
     let ctx = unsafe { &mut *card.ctx };
@@ -2794,15 +2794,15 @@ mod tests {
 
     #[test]
     fn profile_bound_scb_bytes() -> Result<(), i32> {
-        use std::ptr::null_mut;
+        use std::ptr::{from_mut, null_mut, without_provenance_mut};
         use opensc_sys::types::{sc_acl_entry, SC_AC_SCB, SC_MAX_AC_OPS, SC_AC_OP_READ, SC_AC_OP_UPDATE, SC_AC_OP_CRYPTO,
                                 SC_AC_OP_INVALIDATE, SC_AC_OP_REHABILITATE, SC_AC_OP_LOCK, SC_AC_OP_DELETE_SELF};
         use super::{convert_acl_array_to_bytes_tag_fcp_sac, ACL_CATEGORY_KEY};
         /* the ACLs of the +bound profile option, as the profile parser leaves them: *=NEVER, then one entry per op */
-        let never = 1 as *mut sc_acl_entry;
+        let never = without_provenance_mut::<sc_acl_entry>(1);
         let mut scb = [0x01_u8, 0x42, 0x45].map(|key_ref| sc_acl_entry { method: SC_AC_SCB, key_ref: key_ref.into(),
                                                                           next: null_mut() });
-        let [scb1, scb42, scb45] = scb.each_mut().map(std::ptr::from_mut);
+        let [scb1, scb42, scb45] = scb.each_mut().map(from_mut);
         let op = |op: u32| usize::try_from(op).unwrap_or(0);
         let mut private = [never; SC_MAX_AC_OPS];
         for o in [SC_AC_OP_DELETE_SELF, SC_AC_OP_REHABILITATE, SC_AC_OP_INVALIDATE] { private[op(o)] = scb1; }

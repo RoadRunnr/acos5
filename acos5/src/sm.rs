@@ -1197,7 +1197,7 @@ fn evo_pad(v: &mut Vec<u8>) {
 
 fn evo_unpad(v: &[u8]) -> Option<&[u8]> {
     let end = v.iter().rposition(|&b| b != 0)?;
-    if v[end] == 0x80 { Some(&v[..end]) } else { None }
+    (v[end] == 0x80).then(|| &v[..end])
 }
 
 fn evo_incr(b: &mut [u8; AES_BLOCK_SIZE]) {
@@ -1597,13 +1597,18 @@ fn evo_sm_common_update(card: &mut sc_card, idx: u16, buf: &[u8], flags: c_ulong
 mod tests_evo_sm {
     use opensc_sys::errors::SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
     use crate::sm_config::SmMode;
-    use opensc_sys::errors::{SC_ERROR_AUTH_METHOD_BLOCKED, SC_ERROR_PIN_CODE_INCORRECT, SC_SUCCESS};
+    use opensc_sys::errors::{SC_ERROR_AUTH_METHOD_BLOCKED, SC_ERROR_PIN_CODE_INCORRECT, SC_ERROR_SM, SC_SUCCESS};
     use super::{evo_incr, evo_pad, evo_unpad, evo_sm_use, evo_sm_wrap, evo_sm_unwrap, map_inner_sw, SmCmd, SmUse};
+    use core::array::from_fn;
+    use std::fmt::Write as _;
     use crate::crypto::{aes_cbc_nopad, aes_cmac, Encrypt};
 
+    /* one row of an SM decision table: mode, SCB, SE record has a CT, the expected result per command */
+    type Row<const N: usize> = (SmMode, u8, bool, [Result<SmUse, i32>; N]);
+
     /* fixed test vector, not a card key (as tools/tests/test_evo_sm.py) */
-    fn test_key() -> [u8; 24] { core::array::from_fn(|i| u8::try_from(i).unwrap_or(0)) }
-    fn test_challenge() -> [u8; 16] { core::array::from_fn(|i| u8::try_from(16 + i).unwrap_or(0)) }
+    fn test_key() -> [u8; 24] { from_fn(|i| u8::try_from(i).unwrap_or(0)) }
+    fn test_challenge() -> [u8; 16] { from_fn(|i| u8::try_from(16 + i).unwrap_or(0)) }
 
     #[test]
     fn decipher_always_plain() {
@@ -1622,7 +1627,7 @@ mod tests_evo_sm {
         const ERR: Result<SmUse, i32> = Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED);
         /* +bound key EFs: SCB 42 = SE #2 (user PIN, CCT and CT) for the private key EF's use and update and the
            public key EF's update; SCB 45 = SE #5 (CCT only) for the public key EF's read */
-        let rows: [(SmMode, u8, bool, [Result<SmUse, i32>; 4]); 6] = [
+        let rows: [Row<4>; 6] = [
             //                           Sign   GenKey GetKey PutKey
             (SmMode::Acl,      0x42, true,  [Ok(E), Ok(E), Ok(E), Ok(E)]),
             (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M)]),
@@ -1657,7 +1662,7 @@ mod tests_evo_sm {
         assert_eq!(hex(&evo_sm_wrap(&key, &iv, [0x00, 0x2A, 0x9E, 0x9A], &data, false, 0)), want);
     }
 
-    fn hex(v: &[u8]) -> String { v.iter().map(|b| format!("{b:02x}")).collect() }
+    fn hex(v: &[u8]) -> String { v.iter().fold(String::new(), |mut s, b| { write!(s, "{b:02x}").unwrap(); s }) }
 
     #[test]
     fn mac_over_16_byte_data_object_field() {
@@ -1701,13 +1706,14 @@ mod tests_evo_sm {
 
         let mut out = [0_u8; 512];
         assert_eq!(evo_sm_unwrap(&resp, &key, &iv, &mut out).map_err(|e| e.0), Ok((256, 0x9000)));
-        assert_eq!(&out[..256], &reply[..]);
+        assert_eq!(&out[..256], reply.as_slice());
         /* the MAC covers the whole response */
         let mut bad = resp.clone();
         bad[100] ^= 1;
-        assert!(evo_sm_unwrap(&bad, &key, &iv, &mut out).is_err());
+        assert_eq!(evo_sm_unwrap(&bad, &key, &iv, &mut out).err(), Some((SC_ERROR_SM, c"Error: SM response MAC mismatch")));
         /* an output buffer too small for the joined data */
-        assert!(evo_sm_unwrap(&resp, &key, &iv, &mut out[..255]).is_err());
+        assert_eq!(evo_sm_unwrap(&resp, &key, &iv, &mut out[..255]).err(),
+                   Some((SC_ERROR_SM, c"Error: SM response longer than the buffer")));
     }
 
     #[test]
@@ -1730,7 +1736,7 @@ mod tests_evo_sm {
                                    SmCmd::PinStatus];
         const ERR: Result<SmUse, i32> = Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED);
         /* SCB 45: SE record 5 (CCT only), SCB 46: SE record 6 (CCT and CT) */
-        let rows: [(SmMode, u8, bool, [Result<SmUse, i32>; 11]); 12] = [
+        let rows: [Row<11>; 12] = [
             //                           Read   Update Verify ChgPin Unblk  PutKey GenKey Sign   Decip  GetKey PinSt
             (SmMode::None,     0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
             (SmMode::None,     0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
