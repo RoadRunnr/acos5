@@ -537,9 +537,30 @@ pub(crate) fn aes_cmac(data: &[u8], key: &[u8]) -> [u8; AES_BLOCK_SIZE] {
     x
 }
 
+/* NIST SP 800-108 counter mode KDF with AES-CMAC as PRF. Block i (1 byte, from 1) is
+   CMAC(kmc, i || label || 00 || context || L), L = out_len in bits (2 bytes, big-endian). */
+#[must_use]
+pub(crate) fn kbkdf_cmac(kmc: &[u8], label: &[u8], context: &[u8], out_len: usize) -> Vec<u8> {
+    let bits = u16::try_from(out_len * 8).expect("KDF output too long");
+    let mut fixed = label.to_vec();
+    fixed.push(0);
+    fixed.extend_from_slice(context);
+    fixed.extend_from_slice(&bits.to_be_bytes());
+    let mut out = Vec::with_capacity(out_len + AES_BLOCK_SIZE);
+    let mut counter = 1_u8;
+    while out.len() < out_len {
+        let mut block = vec![counter];
+        block.extend_from_slice(&fixed);
+        out.extend_from_slice(&aes_cmac(&block, kmc));
+        counter += 1;
+    }
+    out.truncate(out_len);
+    out
+}
+
 #[cfg(test)]
 mod tests_evo_aes {
-    use super::{aes_cbc_nopad, aes_cmac, Encrypt, Decrypt};
+    use super::{aes_cbc_nopad, aes_cmac, kbkdf_cmac, Encrypt, Decrypt};
 
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace().map(|b| u8::from_str_radix(b, 16).unwrap()).collect()
@@ -554,6 +575,16 @@ mod tests_evo_aes {
         assert_eq!(aes_cmac(&m, &key).to_vec(), hex("9e 99 a7 bf 31 e7 10 90 06 62 f6 5e 61 7c 51 84"));
         let m40 = hex("6b c1 be e2 2e 40 9f 96 e9 3d 7e 11 73 93 17 2a ae 2d 8a 57 1e 03 ac 9c 9e b7 6f ac 45 af 8e 51 30 c8 1c 46 a3 5c e4 11");
         assert_eq!(aes_cmac(&m40, &key).to_vec(), hex("8a 1d e5 be 2e b3 1a ad 08 9a 82 e6 ee 90 8b 0e"));
+    }
+
+    #[test]
+    fn kbkdf_cmac_vector() {
+        let kmc: Vec<u8> = (0..32).collect();
+        let serial = hex("60 20 60 A1 C4 65 0A 00");
+        assert_eq!(kbkdf_cmac(&kmc, b"ACOS5-EVO SM", &serial, 24),
+                   hex("37 9a f8 cb e5 d9 10 d3 69 3c 63 b4 e8 82 e9 2a 3d bc bf 99 a1 0b f7 80"));
+        assert_eq!(kbkdf_cmac(&kmc, b"ACOS5-EVO AUTH", &serial, 24),
+                   hex("d6 ca ad d8 07 a4 c2 2a 4a a0 93 81 d2 a1 de 1c 15 7f 1c f8 23 58 24 c5"));
     }
 
     #[test]
