@@ -47,7 +47,6 @@ use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_WRONG_PADDING, SC_ERROR_INTERNAL, 
 
 use opensc_sys::types::sc_object_id;
 use crate::constants_types::safe_int_try_from;
-use crate::sm_config::wipe;
 /*, sc_apdu, SC_APDU_CASE_1, SC_APDU_CASE_2_SHORT, SC_APDU_CASE_2_EXT,
                        SC_APDU_CASE_3_SHORT, SC_APDU_CASE_3_EXT, SC_APDU_CASE_4_SHORT, SC_APDU_CASE_4_EXT*/
 
@@ -439,21 +438,52 @@ pub(crate) fn me_pkcs1_strip_02_padding(vec: &mut Vec<u8>) -> i32 //-> Result<Ve
 /// leaves the padding in the result (tested with a real ACOS5-EVO card). On an error nothing is written to `out`.
 ///
 /// # Errors
-/// As `me_pkcs1_strip_02_padding`; `SC_ERROR_BUFFER_TOO_SMALL` if the message does not fit `out`.
+/// As `pkcs1_02_message_start`; `SC_ERROR_BUFFER_TOO_SMALL` if the message does not fit `out`.
 pub(crate) fn evo_strip_02(block: &[u8], out: &mut [u8]) -> Result<usize, i32> {
-    let mut vec = block.to_vec();
-    let rv = me_pkcs1_strip_02_padding(&mut vec);
-    let result = if rv < 0 { Err(rv) }
-                 else if vec.len() > out.len() { Err(SC_ERROR_BUFFER_TOO_SMALL) }
-                 else { out[..vec.len()].copy_from_slice(&vec); Ok(vec.len()) };
-    wipe(&mut vec);
-    result
+    let msg = &block[pkcs1_02_message_start(block)?..];
+    if msg.len() > out.len() { return Err(SC_ERROR_BUFFER_TOO_SMALL); }
+    out[..msg.len()].copy_from_slice(msg);
+    Ok(msg.len())
+}
+
+/// Where the message of a PKCS#1 v1.5 type 02 block starts: after `00 02`, at least 8 nonzero padding bytes and
+/// `00`. Works on the block in place, so the plaintext is not copied.
+///
+/// # Errors
+/// `SC_ERROR_INTERNAL` for a block shorter than 11 bytes, `SC_ERROR_WRONG_PADDING` for any other format error.
+fn pkcs1_02_message_start(block: &[u8]) -> Result<usize, i32> {
+    if block.len() < 11 { return Err(SC_ERROR_INTERNAL); }
+    if block[..2] != [0, 2] { return Err(SC_ERROR_WRONG_PADDING); }
+    match block[2..].iter().position(|&b| b == 0) {
+        Some(i) if i >= 8 => Ok(i + 3),
+        _ => Err(SC_ERROR_WRONG_PADDING),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{evo_strip_02, me_pkcs1_strip_01_padding, me_pkcs1_strip_02_padding, SC_ERROR_WRONG_PADDING,
+    use super::{evo_strip_02, pkcs1_02_message_start, me_pkcs1_strip_01_padding, me_pkcs1_strip_02_padding, SC_ERROR_WRONG_PADDING,
                 SC_ERROR_INTERNAL, SC_ERROR_BUFFER_TOO_SMALL};
+
+    #[test]
+    fn pkcs1_02_message_start_finds_the_message() {
+        let mut block = vec![0x00_u8, 0x02];
+        block.extend([0x5A; 8]);
+        block.push(0x00);
+        block.extend([0xAB, 0xCD]);
+        assert_eq!(pkcs1_02_message_start(&block), Ok(11));
+        /* fewer than 8 padding bytes, wrong block type, no separator, too short */
+        let mut short_ps = vec![0x00_u8, 0x02];
+        short_ps.extend([0x5A; 7]);
+        short_ps.extend([0x00, 0xAB, 0xCD]);
+        assert_eq!(pkcs1_02_message_start(&short_ps), Err(SC_ERROR_WRONG_PADDING));
+        let mut type1 = block.clone();
+        type1[1] = 0x01;
+        assert_eq!(pkcs1_02_message_start(&type1), Err(SC_ERROR_WRONG_PADDING));
+        assert_eq!(pkcs1_02_message_start(&[0x00, 0x02, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A]),
+                   Err(SC_ERROR_WRONG_PADDING));
+        assert_eq!(pkcs1_02_message_start(&[0x00, 0x02, 0x00]), Err(SC_ERROR_INTERNAL));
+    }
 
     #[test]
     fn strip_02_after_sm() {

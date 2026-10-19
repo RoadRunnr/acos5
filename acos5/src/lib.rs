@@ -3719,6 +3719,9 @@ fn acos5_decipher(card: &mut sc_card, ctx: &mut sc_context, crgram: &[u8], out: 
     let f = f_cstr.as_c_str();
     let mut rv;
     log3if!(ctx,f,line!(), c"called with: in_len: %zu, out_len: %zu", crgram.len(), out.len());
+    /* read and reset once, so that no error return leaves it set for the next decipher */
+    let for_signature = get_is_running_compute_signature(card);
+    set_is_running_compute_signature(card, false);
     if out.len() < crgram.len() { return Err(-1); }
 ////assert_eq!(crgram_len, get_sec_env_mod_len(card));
 //println!("acos5_decipher          called with: in_len: {}, out_len: {}, {}, crgram: {:X?}", crgram_len, outlen, get_is_running_compute_signature(card), unsafe {from_raw_parts(crgram_ref_ptr, crgram_len)});
@@ -3743,8 +3746,6 @@ fn acos5_decipher(card: &mut sc_card, ctx: &mut sc_context, crgram: &[u8], out: 
         if file_ref.len >= 2 {
             let fid = u16::from_be_bytes([file_ref.value[file_ref.len-2], file_ref.value[file_ref.len-1]]);
             if evo_key_sm_use(card, fid, CRYPTO, SmCmd::Decipher).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))? != SmUse::Plain {
-                let for_signature = get_is_running_compute_signature(card);
-                set_is_running_compute_signature(card, false);
                 let raw_allowed = (SC_ALGORITHM_RSA_RAW & get_sec_env(card).algorithm_flags) != 0;
                 let mut buf = vec![0_u8; crgram.len()];
                 let result = evo_sm_transmit_chained(card, [0, 0x2A, 0x80, 0x84], crgram, &mut buf).and_then(|n| {
@@ -3798,10 +3799,7 @@ fn acos5_decipher(card: &mut sc_card, ctx: &mut sc_context, crgram: &[u8], out: 
     //println!("acos5_decipher: apdu.resplen {}", apdu.resplen);
     vec.truncate(min(crgram.len(), apdu.resplen));
 
-    if get_is_running_compute_signature(card) {
-        set_is_running_compute_signature(card, false);
-    }
-    else { // assuming plaintext was EME-PKCS1-v1_5 encoded before encipher: Now remove the padding
+    if !for_signature { // assuming plaintext was EME-PKCS1-v1_5 encoded before encipher: Now remove the padding
         // let sec_env_algo_flags = get_sec_env(card).algorithm_flags;
         // println!("\nacos5_decipher:             in_len: {}, out_len: {}, sec_env_algo_flags: 0x{:X}, input data: {:X?}", crgram_len, outlen, sec_env_algo_flags,  unsafe {from_raw_parts(crgram_ref_ptr, crgram_len)});
         // println!("\nacos5_decipher:             in_len: {}, out_len: {}, sec_env_algo_flags: 0x{:X},output data: {:X?}", crgram_len, outlen, sec_env_algo_flags,  vec);

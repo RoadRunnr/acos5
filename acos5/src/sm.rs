@@ -1277,6 +1277,11 @@ pub(crate) fn evo_sm_decide(card: &mut sc_card, scb: u8, has_ct: bool, cmd: SmCm
     }
     let serial_c = CString::new(config.serial_hex()).unwrap_or_default();
     match evo_sm_use(config.mode, scb, has_ct, cmd) {
+        Err(e) if cmd == SmCmd::Decipher && config.mode != SmMode::None && !has_ct => {
+            log3if!(ctx,f,line!(), c"secure_messaging: card %s: PSO DECIPHER under SM needs an SE record with a CT (encryption)",
+                serial_c.as_ptr());
+            Err(e)
+        },
         Err(e) if config.mode == SmMode::Transmit => {
             log3if!(ctx,f,line!(), c"secure_messaging: card %s: mode transmit refused a PIN or key command without encryption",
                 serial_c.as_ptr());
