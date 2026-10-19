@@ -1375,7 +1375,8 @@ pub(crate) fn evo_sm_transmit_chained(card: &mut sc_card, cmd: [u8; 4], data: &[
             let ctx = unsafe { &mut *card.ctx };
             let [sw1, sw2] = sw.to_be_bytes();
             let rv = unsafe { sc_check_sw(card, u32::from(sw1), u32::from(sw2)) };
-            let rv = if rv == SC_SUCCESS || !authentic && sw == 0x9000 { SC_ERROR_SM } else { rv };
+            /* an SW that sc_check_sw accepts is still an error here: a wrong inner SW, or one without a MAC */
+            let rv = if rv == SC_SUCCESS { SC_ERROR_SM } else { rv };
             return Err(log3ifr_ret!(ctx, c"evo_sm_transmit_chained", line!(), rv));
         }
         len = n;

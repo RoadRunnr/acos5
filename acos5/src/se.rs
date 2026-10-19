@@ -76,6 +76,7 @@ For SAE (Security Attributes Expanded), TODO
 
 //#![expect(clippy::module_name_repetitions, reason = "..")]
 
+use std::cmp::min;
 use opensc_sys::opensc::{sc_card, sc_file_add_acl_entry};
 use opensc_sys::types::{sc_file, sc_crt, SC_AC_NONE, SC_AC_NEVER, SC_AC_UNKNOWN, SC_AC_KEY_REF_NONE,
 SC_AC_CHV, SC_AC_AUT, SC_AC_PRO,
@@ -167,6 +168,13 @@ fn scb_allowed(scb: u8, evo: bool) -> bool {
     !(record == 0 || record == 0x0F || scb & 0x30 != 0 || (scb & 0xC0 == 0xC0 && !evo))
 }
 
+/// How many of the references of an SE record go into the file's ACL. With bit 7 of the SCB clear any one condition
+/// is enough; an ACL has no OR, so it gets the first. With bit 7 set (`8n`, and `Cn` on the ACOS5-EVO) every
+/// condition must be met, so it gets all of them.
+fn acl_ref_count(scb: u8, refs: usize) -> usize {
+    if scb & 0x80 == 0 { min(1, refs) } else { refs }
+}
+
 //#[allow(clippy::needless_return)]
 fn se_file_add_acl_entry(card: &mut sc_card, file: &mut sc_file, scb: u8, op: u32)
 {
@@ -212,9 +220,7 @@ SCB: C1; [80 01 01  A4 09 83 01 81 83 01 01 95 01 08  B4 08 84 00 95 01 30 80 01
                 assert_eq!(SC_SUCCESS, rv);
                 return;
             }
-            /* SM implicitly has the (unsupported by OpenSC) OR operator for access conditions, thus drop any references except the first */
-            let loop_cnt = if (scb & 0x40) != 0 || (scb & 0x80) == 0 { 1_usize }
-                                  else { pin_ref.len() };
+            let loop_cnt = acl_ref_count(scb, pin_ref.len());
             for &elem in pin_ref.iter().take(loop_cnt) {
                 rv =unsafe { sc_file_add_acl_entry(file, op, SC_AC_CHV, elem.into()) };
                 assert_eq!(SC_SUCCESS, rv);
@@ -253,10 +259,7 @@ SCB: 81; [80 01 01  A4 09 83 01 01 83 01 81 95 01 80  B4 08 84 00 95 01 30 80 01
                 contains_sm_key = key_ref.contains(&0x81);
             }
 
-            /* SM implicitly has the (unsupported by OpenSC) OR operator for access conditions, thus drop any references except the first */
-            let loop_cnt = if contains_sm_key { 0_usize }
-                                  else if (scb & 0x40) != 0 || (scb & 0x80) == 0 { 1_usize }
-                                  else { key_ref.len() };
+            let loop_cnt = if contains_sm_key { 0_usize } else { acl_ref_count(scb, key_ref.len()) };
             for &elem in key_ref.iter().take(loop_cnt) {
                 rv = unsafe { sc_file_add_acl_entry(file, op, SC_AC_AUT, elem.into()) };
                 assert_eq!(SC_SUCCESS, rv);
@@ -294,10 +297,7 @@ SCB: 81; [80 01 01  A4 09 83 01 81 83 01 01 95 01 88]                           
                 contains_sm_key = pin_key_ref.contains(&0x81);
             }
 
-            /* SM implicitly has the (unsupported by OpenSC) OR operator for access conditions, thus drop any references except the first */
-            let loop_cnt = //if contains_sm_key { 0_usize }
-                if (scb & 0x40) != 0 || (scb & 0x80) == 0 { 1_usize }
-                else { pin_key_ref.len() };
+            let loop_cnt = acl_ref_count(scb, pin_key_ref.len());
             for &elem in pin_key_ref.iter().take(loop_cnt) {
                 rv = unsafe { sc_file_add_acl_entry(file, op, SC_AC_CHV, elem.into()) };
                 assert_eq!(SC_SUCCESS, rv);
@@ -670,6 +670,15 @@ pub(crate) fn se_parse_sae(vec_sac_info_opt: &mut Option<Vec<SACinfo>>, value_by
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acl_ref_count_bit7() {
+        assert_eq!(acl_ref_count(0x01, 2), 1);   // any one condition: OpenSC gets the first reference
+        assert_eq!(acl_ref_count(0x41, 2), 1);
+        assert_eq!(acl_ref_count(0x81, 2), 2);   // all conditions
+        assert_eq!(acl_ref_count(0xC2, 2), 2);   // all conditions and SM (ACOS5-EVO)
+        assert_eq!(acl_ref_count(0x01, 0), 0);
+    }
 
     #[test]
     fn scb_allowed_bit7() {
