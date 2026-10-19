@@ -90,13 +90,13 @@ use crate::constants_types::{ATR_MASK, ATR_V2, ATR_V3, BLOCKCIPHER_PAD_TYPE_ANSI
                              file_id_from_path_value, file_id_se,
                              CRT_TAG_HT, CRT_TAG_CCT, CRT_TAG_DST, CRT_TAG_CT,
                              SC_SEC_OPERATION_GENERATE_ECCPRIVATE, SC_SEC_OPERATION_GENERATE_ECCPUBLIC,
-                             prev_multiple_of, safe_int_try_from, CRYPTO
+                             prev_multiple_of, safe_int_try_from, CRYPTO, UPDATE, CardCtlEvoSmTransmit
 };
 use crate::se::{se_parse_sac, se_get_is_scb_suitable_for_sm_has_ct};
 use crate::path::{cut_path, file_id_from_cache_current_path, current_path_df, is_impossible_file_match};
 //use crate::missing_exports::me_get_max_recv_size;
 //use crate::cmd_card_info::is_pin_authenticated;
-use crate::sm::{SM_SMALL_CHALLENGE_LEN_u8, sm_common_read, sm_common_update, evo_sm_decide, evo_sm_transmit,
+use crate::sm::{SM_SMALL_CHALLENGE_LEN_u8, sm_common_read, sm_common_update, evo_sm_decide, evo_sm_transmit, evo_sm_transmit_sw,
                 SmCmd, SmUse};
 use crate::crypto::{RAND_bytes, des_ecb3_unpadded_8, Encrypt};
 
@@ -2571,6 +2571,51 @@ pub(crate) fn evo_key_sm_use(card: &mut sc_card, file_id: u16, scb_idx: usize, c
     evo_file_sm_use(card, file_id, scb, cmd)
 }
 
+/// `SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT`: PUT KEY `80 DA P1 P2` (P1 P2 = offset) into the selected key EF, in plain or
+/// under SM as the key EF's UPDATE SCB decides (`SmCmd::PutKey`: mode `transmit` refuses it in plain). The data are
+/// split into commands of up to 255 bytes in plain and 96 bytes under SM (each `87` object stays below 128 bytes),
+/// with the offset advanced per command. SW `63 01` (key pair not consistent yet) counts as success.
+///
+/// # Errors
+/// As `evo_key_sm_use` and `evo_sm_transmit_sw`; the mapped SW if the card refuses a command.
+pub(crate) fn evo_put_key(card: &mut sc_card, ctl: &mut CardCtlEvoSmTransmit) -> Result<i32, i32>
+{
+    let ctx = unsafe { &mut *card.ctx };
+    let f = c"evo_put_key";
+    if ctl.cmd[..2] != [0x80, 0xDA] || ctl.data.is_null() || ctl.data_len == 0 || ctl.data_len > 0x1_0000 {
+        return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_INVALID_ARGUMENTS));
+    }
+    let data = unsafe { from_raw_parts(ctl.data, ctl.data_len) };
+    let file_id = file_id_from_cache_current_path(card);
+    let sm_use = evo_key_sm_use(card, file_id, UPDATE, SmCmd::PutKey).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
+    ctl.use_ = match sm_use { SmUse::Plain => 0, SmUse::Mac => 1, SmUse::MacEnc => 2 };
+    let chunk = if sm_use == SmUse::Plain { 0xFF } else { 96 };
+    let offset = usize::from(u16::from_be_bytes([ctl.cmd[2], ctl.cmd[3]]));
+    for (n, part) in data.chunks(chunk).enumerate() {
+        let [hi, lo] = safe_int_try_from::<usize, u16>(offset + n * chunk).to_be_bytes();
+        let sw = if sm_use == SmUse::Plain {
+            let mut cmd = vec![0x80_u8, 0xDA, hi, lo, safe_int_try_from(part.len())];
+            cmd.extend_from_slice(part);
+            let mut apdu = build_apdu(ctx, &cmd, SC_APDU_CASE_3_SHORT, &mut []);
+            let rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };
+            cmd.fill(0);
+            if rv != SC_SUCCESS { return Err(log3ifr_ret!(ctx,f,line!(), rv)); }
+            u16::from_be_bytes([safe_int_try_from(apdu.sw1), safe_int_try_from(apdu.sw2)])
+        }
+        else {
+            evo_sm_transmit_sw(card, [0x80, 0xDA, hi, lo], part, sm_use == SmUse::MacEnc, 0, &mut [])
+                .map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?.1
+        };
+        ctl.sw = sw;
+        if sw != 0x9000 && sw != 0x6301 {
+            let [sw1, sw2] = sw.to_be_bytes();
+            let rv = unsafe { sc_check_sw(card, u32::from(sw1), u32::from(sw2)) };
+            return Err(log3ifr_ret!(ctx,f,line!(), if rv == SC_SUCCESS { SC_ERROR_CARD_CMD_FAILED } else { rv }));
+        }
+    }
+    Ok(log3ifr_ret!(ctx,f,line!(), SC_SUCCESS))
+}
+
 
 ///
 /// # Panics
@@ -2724,6 +2769,38 @@ mod tests {
         let bytes_tag_fcp_sac = [0x2B, 0x05, 0x03, 0x01, 0x45];
         scb8 = convert_bytes_tag_fcp_sac_to_scb_array(&bytes_tag_fcp_sac)?;
         assert_eq!(scb8, [0x45, 0x01, 0x00, 0x03, 0x00, 0x05, 0x00, 0xFF]);
+        Ok(())
+    }
+
+    #[test]
+    fn profile_bound_scb_bytes() -> Result<(), i32> {
+        use std::ptr::null_mut;
+        use opensc_sys::types::{sc_acl_entry, SC_AC_SCB, SC_MAX_AC_OPS, SC_AC_OP_READ, SC_AC_OP_UPDATE, SC_AC_OP_CRYPTO,
+                                SC_AC_OP_INVALIDATE, SC_AC_OP_REHABILITATE, SC_AC_OP_LOCK, SC_AC_OP_DELETE_SELF};
+        use super::{convert_acl_array_to_bytes_tag_fcp_sac, ACL_CATEGORY_KEY};
+        /* the ACLs of the +bound profile option, as the profile parser leaves them: *=NEVER, then one entry per op */
+        let never = 1 as *mut sc_acl_entry;
+        let mut scb = [0x01_u8, 0x42, 0x45].map(|key_ref| sc_acl_entry { method: SC_AC_SCB, key_ref: key_ref.into(),
+                                                                          next: null_mut() });
+        let [scb1, scb42, scb45] = scb.each_mut().map(std::ptr::from_mut);
+        let op = |op: u32| usize::try_from(op).unwrap_or(0);
+        let mut private = [never; SC_MAX_AC_OPS];
+        for o in [SC_AC_OP_DELETE_SELF, SC_AC_OP_REHABILITATE, SC_AC_OP_INVALIDATE] { private[op(o)] = scb1; }
+        private[op(SC_AC_OP_CRYPTO)] = scb42;
+        private[op(SC_AC_OP_UPDATE)] = scb42;
+        let mut public = private;
+        public[op(SC_AC_OP_CRYPTO)] = scb1;
+        public[op(SC_AC_OP_READ)] = scb45;
+        assert_eq!(private[op(SC_AC_OP_LOCK)], never);
+        /* tested with a real ACOS5-EVO card: private 01 FF 01 01 42 42 FF, public 01 FF 01 01 01 42 45 */
+        let sac = convert_acl_array_to_bytes_tag_fcp_sac(&private, ACL_CATEGORY_KEY)?;
+        assert_eq!(sac, [0x7F, 0x01, 0xFF, 0x01, 0x01, 0x42, 0x42, 0xFF]);
+        let scb8 = convert_bytes_tag_fcp_sac_to_scb_array(&sac)?;
+        assert_eq!((scb8[CRYPTO], scb8[UPDATE], scb8[READ]), (0x42, 0x42, 0xFF));
+        let sac = convert_acl_array_to_bytes_tag_fcp_sac(&public, ACL_CATEGORY_KEY)?;
+        assert_eq!(sac, [0x7F, 0x01, 0xFF, 0x01, 0x01, 0x01, 0x42, 0x45]);
+        let scb8 = convert_bytes_tag_fcp_sac_to_scb_array(&sac)?;
+        assert_eq!((scb8[CRYPTO], scb8[UPDATE], scb8[READ]), (0x01, 0x42, 0x45));
         Ok(())
     }
 

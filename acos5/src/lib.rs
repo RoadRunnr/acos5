@@ -492,7 +492,8 @@ use constants_types::{BLOCKCIPHER_PAD_TYPE_ANSIX9_23, BLOCKCIPHER_PAD_TYPE_ONEAN
                       file_id_from_path_value, file_id, file_id_se, Fci,
                       SC_CARDCTL_ACOS5_ALGO_REF_SYM_STORE, CardCtlAlgoRefSymStore, CRT_TAG_DST, CRT_TAG_CT,
                       SC_SEC_OPERATION_GENERATE_ECCPRIVATE, SC_SEC_OPERATION_GENERATE_ECCPUBLIC,
-                      SC_SEC_OPERATION_ENCIPHER_ECCPUBLIC, ECPUB_MAX_LEN, safe_int_try_from, CRYPTO
+                      SC_SEC_OPERATION_ENCIPHER_ECCPUBLIC, ECPUB_MAX_LEN, safe_int_try_from, CRYPTO, SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT,
+                      SC_CARDCTL_ACOS5_EVO_SM_KEYS, CardCtlEvoSmTransmit, CardCtlEvoSmKeys
                       /*,PKCS15_FILE_TYPE_ECCPRIVATEKEY, PKCS15_FILE_TYPE_ECCPUBLICKEY, READ*/};
 
 #[cfg(iup_user_consent)]
@@ -521,7 +522,7 @@ use no_cdecl::{select_file_by_path, enum_dir,
     ACL_CATEGORY_DF_MF, ACL_CATEGORY_EF_CHV, ACL_CATEGORY_KEY, ACL_CATEGORY_SE,
     get_is_running_compute_signature, set_is_running_compute_signature, algo_ref_sym_store,
     common_read, common_update, acos5_supported_ec_curves, logout_pin, sym_en_decrypt,
-    algo_ref_mse_sedo, evo_file_sm_use, evo_key_sm_use
+    algo_ref_mse_sedo, evo_file_sm_use, evo_key_sm_use, evo_put_key
 };
 
 mod path;
@@ -534,7 +535,7 @@ mod se;
 use se::{map_scb8_to_acl, se_get_is_scb_suitable_for_sm_has_ct, se_parse_sae, se_get_sae_scb};
 
 mod sm;
-use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy, evo_sm_pin_cmd, evo_sm_transmit,
+use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy, evo_sm_pin_cmd, evo_sm_transmit, evo_sm_keys,
          SmCmd, SmUse};
 
 mod sm_config;
@@ -1886,6 +1887,13 @@ fn acos5_card_ctl(card: &mut sc_card, ctx: &mut sc_context, command: c_ulong, da
         SC_CARDCTL_ACOS5_SDO_GENERATE_KEY_FILES =>
             /* suppose select_file, authenticate, (possibly setting MSE) etc. was done already */
             Ok(log3ifr_ret!(ctx,f,line!(), generate_asym(card, unsafe { &mut *data_ptr.cast::<CardCtlGenerateAsymCrypt>() }))),
+        SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT | SC_CARDCTL_ACOS5_EVO_SM_KEYS if card.type_ != SC_CARD_TYPE_ACOS5_EVO_V4 =>
+            Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_NO_CARD_SUPPORT)),
+        SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT =>
+            /* suppose select_file of the key EF and authenticate were done already */
+            evo_put_key(card, unsafe { &mut *data_ptr.cast::<CardCtlEvoSmTransmit>() }),
+        SC_CARDCTL_ACOS5_EVO_SM_KEYS =>
+            evo_sm_keys(card, unsafe { &mut *data_ptr.cast::<CardCtlEvoSmKeys>() }),
         SC_CARDCTL_ACOS5_ENCRYPT_ASYM =>
             /* suppose select_file, authenticate, (possibly setting MSE) etc. was done already */
             Ok(log3ifr_ret!(ctx,f,line!(), encrypt_asym(card, unsafe { &mut *data_ptr.cast::<CardCtlGenerateAsymCrypt>() }, false))),

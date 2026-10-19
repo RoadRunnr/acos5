@@ -313,6 +313,9 @@ pub(crate) const SC_CARDCTL_ACOS5_ENCRYPT_SYM             : c_ulong =  0x0000_00
 pub(crate) const SC_CARDCTL_ACOS5_ENCRYPT_ASYM            : c_ulong =  0x0000_0028; // data: *mut CardCtl_crypt_asym, do_encrypt_asym; Signature verification with public key
 pub(crate) const SC_CARDCTL_ACOS5_DECRYPT_SYM             : c_ulong =  0x0000_0029; // data: *mut CardCtlSymCrypt,  do_decrypt_sym
 //b const SC_CARDCTL_ACOS5_DECRYPT_ASYM            : c_ulong =  0x0000_002A; // data: *mut CardCtl_crypt_asym, do_decrypt_asym; is available via decipher
+/* ACOS5-EVO */
+pub(crate) const SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT        : c_ulong =  0x0000_002B; // data: *mut CardCtlEvoSmTransmit
+pub(crate) const SC_CARDCTL_ACOS5_EVO_SM_KEYS            : c_ulong =  0x0000_002C; // data: *mut CardCtlEvoSmKeys
 
 // array indices of some file related commands in scb8:
 pub(crate) const READ         : usize =  0;
@@ -693,6 +696,27 @@ impl Default for CardCtlGenerateAsymInject {
             do_create_files: true,
         }
     }
+}
+
+/// struct for `SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT` (ACOS5-EVO): PUT KEY `cmd` = `80 DA P1 P2` (P1 P2 = offset) with
+/// `data` into the currently selected key EF. The driver sends it in plain or under SM, as the key EF's UPDATE SCB
+/// and the configured SM mode decide, and splits the data into several commands.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct CardCtlEvoSmTransmit {
+    pub cmd      : [u8; 4],
+    pub data     : *const c_uchar,
+    pub data_len : usize,
+    pub use_     : u8,  // out: how it was sent: 0 plain, 1 SM MAC only, 2 SM MAC and encryption
+    pub sw       : u16, // out: status word of the last command (90 00, or 63 01: key pair not consistent yet)
+}
+
+/// struct for `SC_CARDCTL_ACOS5_EVO_SM_KEYS` (ACOS5-EVO): whether SM keys resolve for the card, and its serial.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub(crate) struct CardCtlEvoSmKeys {
+    pub has_keys : bool,
+    pub serial   : [u8; 8],
 }
 
 // struct for SC_CARDCTL_ACOS5_ENCRYPT_SYM and SC_CARDCTL_ACOS5_DECRYPT_SYM// data: *mut CardCtlSymCrypt, do_encrypt_sym

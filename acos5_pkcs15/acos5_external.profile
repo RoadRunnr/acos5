@@ -290,3 +290,32 @@ filesystem {
         }
     }
 }
+
+# ACOS5-EVO, RSA keys only: pkcs15-init --profile acos5_external+bound ...
+# The key EF pair gets access conditions that ask for SM, so the driver uses SM for this key's GENERATE KEY PAIR,
+# PUT KEY, GET KEY and PSO COMPUTE DIGITAL SIGNATURE (SCB 0x42 = SE record 2: user PIN and SM with MAC and
+# encryption; SCB 0x45 = SE record 5: SM MAC). PSO DECIPHER stays plain.
+# Private key EF: CRYPTO and UPDATE need SE record 2, READ never (SAC 01 FF 01 01 42 42 FF).
+# Public key EF: UPDATE needs SE record 2, READ SE record 5 (SAC 01 FF 01 01 01 42 45).
+# Needs SM keys for the card (evo_init.py --sm). It does not keep a host without the SM keys from using the key:
+# the card does not enforce SM conditions on key EFs. Binding the card to hosts is evo_init.py --bind.
+# Each ACL starts from *=NEVER: an entry added to an op that already has an SCB would only be appended.
+option bound {
+    filesystem {
+        DF MF {
+            DF PKCS15-AppDF {
+                EF template-private-key {
+                    ACL = *=NEVER, DELETE-SELF=SCB1, REHABILITATE=SCB1, INVALIDATE=SCB1,
+                          CRYPTO=SCB0x42, UPDATE=SCB0x42;
+                }
+                EF template-public-key {
+                    file-id   = 00D0;
+                    type      = 9;
+                    structure = transparent;
+                    ACL = *=NEVER, DELETE-SELF=SCB1, REHABILITATE=SCB1, INVALIDATE=SCB1,
+                          CRYPTO=SCB1, UPDATE=SCB0x42, READ=SCB0x45;
+                }
+            }
+        }
+    }
+}

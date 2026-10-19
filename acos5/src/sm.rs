@@ -57,7 +57,8 @@ use opensc_sys::log::sc_dump_hex; /*, SC_LOG_DEBUG_NORMAL, SC_LOG_DEBUG_SM*/
 use opensc_sys::scconf::{scconf_block, scconf_find_blocks, scconf_get_str};
 
 use crate::constants_types::{ACOS5_OBJECT_REF_LOCAL, ACOS5_OBJECT_REF_MAX, CARD_DRV_SHORT_NAME, DataPrivate, build_apdu,
-                             /*p_void,*/ SC_CARD_TYPE_ACOS5_EVO_V4, FDB_RSA_KEY_EF, FDB_ECC_KEY_EF, safe_int_try_from};
+                             /*p_void,*/ SC_CARD_TYPE_ACOS5_EVO_V4, FDB_RSA_KEY_EF, FDB_ECC_KEY_EF, safe_int_try_from,
+                             CardCtlEvoSmKeys};
 use crate::crypto::{DES_KEY_SZ, DES_KEY_SZ_u8, des_ecb3_unpadded_8, des_ede3_cbc_pad_80_mac, des_ede3_cbc_pad_80,
                     DES_set_odd_parity, DES_cblock, Encrypt, Decrypt};
 use crate::no_cdecl::{authenticate_external, authenticate_internal};
@@ -1213,7 +1214,6 @@ pub(crate) enum SmUse { Plain, Mac, MacEnc }
 /// The ACOS5-EVO commands that can be sent under secure messaging. `PinStatus` is the retry counter query
 /// (VERIFY without data): it sends no PIN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "PUT KEY is not sent under SM yet"))]
 pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey, GenerateKey, Sign, Decipher, GetKey,
                         PinStatus }
 
@@ -1291,6 +1291,21 @@ pub(crate) fn evo_sm_decide(card: &mut sc_card, scb: u8, has_ct: bool, cmd: SmCm
         },
         Ok(sm_use) => Ok(sm_use),
     }
+}
+
+/// `SC_CARDCTL_ACOS5_EVO_SM_KEYS`: whether SM keys resolve for the card (looking up the AID first if the keyset
+/// entries could not be looked up yet), and the card serial.
+///
+/// # Errors
+/// As `evo_sm_config` and `evo_sm_find_aid`.
+pub(crate) fn evo_sm_keys(card: &mut sc_card, out: &mut CardCtlEvoSmKeys) -> Result<i32, i32> {
+    let mut config = evo_sm_config(card)?;
+    if !config.aid_known && config.keys.is_none() && evo_sm_find_aid(card)? {
+        config = evo_sm_config(card)?;
+    }
+    out.has_keys = config.keys.is_some();
+    out.serial = config.serial;
+    Ok(SC_SUCCESS)
 }
 
 /// The SM key (key 82, AES-192) from the card's configuration. The caller wipes it after use.

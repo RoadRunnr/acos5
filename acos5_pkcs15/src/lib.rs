@@ -189,7 +189,8 @@ use std::slice::from_raw_parts;
 use function_name::named;
 use opensc_sys::opensc::{/*sc_context,*/ sc_card, sc_select_file, sc_card_ctl, SC_ALGORITHM_DES,
                          SC_ALGORITHM_3DES, SC_ALGORITHM_AES, sc_card_find_rsa_alg, sc_file_new, sc_transmit_apdu,
-                         sc_file_dup, sc_delete_file, sc_check_sw, sc_update_record, SC_RECORD_BY_REC_NR, sc_get_version};
+                         sc_file_dup, sc_delete_file, sc_check_sw, sc_update_record, SC_RECORD_BY_REC_NR, sc_get_version,
+                         sc_file_clear_acl_entries, sc_file_get_acl_entry, sc_file_add_acl_entry};
 
 use opensc_sys::profile::sc_profile;
 use opensc_sys::pkcs15::{sc_pkcs15_card, sc_pkcs15_object, sc_pkcs15_prkey, sc_pkcs15_pubkey, sc_pkcs15_skey_info,
@@ -208,13 +209,13 @@ use opensc_sys::pkcs15::{sc_pkcs15_card, sc_pkcs15_object, sc_pkcs15_prkey, sc_p
 use opensc_sys::pkcs15_init::{sc_pkcs15init_operations, sc_pkcs15init_authenticate/*, sc_pkcs15init_pubkeyargs*/};
 use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_KEYPAD_MSG_TOO_LONG, SC_ERROR_SECURITY_STATUS_NOT_SATISFIED,
                          SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_NOT_SUPPORTED, /*SC_ERROR_NON_UNIQUE_ID,*/
-                         SC_ERROR_INCONSISTENT_PROFILE, SC_ERROR_OUT_OF_MEMORY, SC_ERROR_FILE_NOT_FOUND
+                         SC_ERROR_INCONSISTENT_PROFILE, SC_ERROR_OUT_OF_MEMORY, SC_ERROR_FILE_NOT_FOUND, SC_ERROR_SM_KEYSET_NOT_FOUND
                          //, SC_ERROR_NOT_IMPLEMENTED, SC_ERROR_FILE_ALREADY_EXISTS
                          //,SC_ERROR_INCONSISTENT_CONFIGURATION, SC_ERROR_UNKNOWN, SC_ERROR_FILE_NOT_FOUND
 };
 //use opensc_sys::sm::{sm_info};
 use opensc_sys::types::{sc_file, sc_path, SC_AC_OP_CREATE_EF, SC_AC_OP_DELETE, SC_AC_OP_READ, SC_AC_OP_DELETE_SELF,//SC_AC_OP_DELETE_SELF, SC_FILE_TYPE_INTERNAL_EF,
-                        SC_AC_OP_UPDATE, SC_APDU_CASE_1, SC_APDU_CASE_3_SHORT, SC_PATH_TYPE_PATH, sc_acl_entry};
+                        SC_AC_OP_UPDATE, SC_APDU_CASE_1, SC_APDU_CASE_3_SHORT, SC_PATH_TYPE_PATH, sc_acl_entry, SC_MAX_AC_OPS};
 // SC_FILE_EF_TRANSPARENT, SC_FILE_STATUS_CREATION, SC_MAX_PATH_SIZE,  SC_PATH_TYPE_FILE_ID, SC_AC_OP_DELETE
 //use opensc_sys::types::{/*SC_MAX_CRTS_IN_SE, sc_crt*/};
 use opensc_sys::log::sc_dump_hex; /*sc_do_log, SC_LOG_DEBUG_NORMAL,*/
@@ -227,7 +228,8 @@ mod        constants_types; // shared file among modules acos5, acos5_pkcs15
 use crate::constants_types::{FDB_ECC_KEY_EF, CARD_DRV_SHORT_NAME, DataPrivate, SC_CARDCTL_ACOS5_SDO_CREATE,
                              SC_CARDCTL_ACOS5_SDO_GENERATE_KEY_FILES, SC_CARD_TYPE_ACOS5_64_V3, build_apdu,
                              SC_CARDCTL_ACOS5_SANITY_CHECK, GuardFile, file_id_from_path_value,
-                             SC_CARD_TYPE_ACOS5_EVO_V4};
+                             SC_CARD_TYPE_ACOS5_EVO_V4, SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT, SC_CARDCTL_ACOS5_EVO_SM_KEYS,
+                             CardCtlEvoSmTransmit, CardCtlEvoSmKeys};
 
 mod        missing_exports; // this is NOT the same as in acos5
 use crate::missing_exports::{me_profile_get_file, me_pkcs15_dup_bignum/*, my_file_dup*/};
@@ -247,7 +249,7 @@ cfg_select! {
 
 
 mod        wrappers; // shared file among modules acos5, acos5_pkcs15
-use crate::wrappers::{wr_do_log, wr_do_log_rv, wr_do_log_sds, wr_do_log_t, wr_do_log_tu};
+use crate::wrappers::{wr_do_log, wr_do_log_rv, wr_do_log_sds, wr_do_log_t, wr_do_log_tu, wr_do_log_tuvw};
 
 
 const BOTH : u32 = SC_PKCS15_PRKEY_USAGE_SIGN | SC_PKCS15_PRKEY_USAGE_DECRYPT;
@@ -552,6 +554,12 @@ extern "C" fn acos5_pkcs15_create_key(profile_ptr: *mut sc_profile,
         return SC_SUCCESS;
     }
 
+
+    let bound = profile_has_option(profile, c"bound");
+    if bound {
+        let rv = bound_check(card, object.type_);
+        if rv != SC_SUCCESS { return rv; }
+    }
 
     let (ax, ay) = match free_fid_asym(p15card) {
         Ok((ax, ay)) => (ax, ay),
@@ -860,8 +868,18 @@ log3if!(ctx,f,line!(), c"file_priv.path: %s",
         dp.agi.file_id_pub  = u16::try_from(file_pub.id).unwrap();
         card.drv_data = Box::into_raw(dp).cast::<c_void>();
     }
-    // TODO don't leak old file_pub.acl[SC_AC_OP_READ]
-    file_pub.acl[SC_AC_OP_READ as usize] = 0x2 as *mut sc_acl_entry; // ALWAYS allowed to be read
+    if bound {
+        /* +bound: the public key EF gets the ACL of template-public-key (UPDATE and READ under SM) */
+        rv = copy_acl_from_template(profile, file_pub, c"template-public-key");
+        if rv != SC_SUCCESS {
+            log3if!(ctx,f,line!(), c"Inconsistent profile: cannot find %s", c"template-public-key".as_ptr());
+            return rv;
+        }
+    }
+    else {
+        // TODO don't leak old file_pub.acl[SC_AC_OP_READ]
+        file_pub.acl[SC_AC_OP_READ as usize] = 0x2 as *mut sc_acl_entry; // ALWAYS allowed to be read
+    }
 //println!("file_pub: {:02X?}", *file_pub);
 //println!("key_info: {:02X?}", *key_info);
 
@@ -988,6 +1006,57 @@ log3if!(ctx,f,line!(), c"file_priv.path: %s",
     rv
 } // acos5_pkcs15_create_key
 
+
+/* Whether the profile option `name` is in use (pkcs15-init --profile acos5_external+name). */
+fn profile_has_option(profile: &sc_profile, name: &CStr) -> bool {
+    profile.options.iter().take_while(|p| !p.is_null()).any(|&p| unsafe { CStr::from_ptr(p) } == name)
+}
+
+/* Profile option `bound` (ACOS5-EVO): the key EF pair gets access conditions that ask for SM, so the driver uses SM
+   for that key's GENERATE KEY PAIR, PUT KEY, GET KEY and PSO COMPUTE DIGITAL SIGNATURE. It needs RSA (the card
+   refuses SM for EC key generation and signing) and SM keys for the card. It does not keep foreign hosts from
+   using the key: the card does not enforce SM conditions on key EFs (binding is the card-wide `--bind`). */
+fn bound_check(card: &mut sc_card, key_type: u32) -> i32 {
+    let ctx = unsafe { &mut *card.ctx };
+    let f = c"acos5_pkcs15_create_key";
+    if card.type_ != SC_CARD_TYPE_ACOS5_EVO_V4 {
+        log3if!(ctx,f,line!(), c"+bound is for the ACOS5-EVO only");
+        return SC_ERROR_NOT_SUPPORTED;
+    }
+    if key_type != SC_PKCS15_TYPE_PRKEY_RSA {
+        log3if!(ctx,f,line!(), c"+bound is for RSA keys only: the card refuses SM for EC key generation and signing");
+        return SC_ERROR_NOT_SUPPORTED;
+    }
+    let mut keys = CardCtlEvoSmKeys::default();
+    let rv = unsafe { sc_card_ctl(card, SC_CARDCTL_ACOS5_EVO_SM_KEYS, (&raw mut keys).cast::<c_void>()) };
+    if rv != SC_SUCCESS { return rv; }
+    if !keys.has_keys {
+        let serial: String = keys.serial.iter().map(|b| format!("{b:02X}")).collect();
+        let serial = CString::new(serial).unwrap_or_default();
+        log3if!(ctx,f,line!(), c"+bound needs SM keys for card %s", serial.as_ptr());
+        return SC_ERROR_SM_KEYSET_NOT_FOUND;
+    }
+    SC_SUCCESS
+}
+
+/* Replace the ACL of `file` with the ACL of the profile file `name`. */
+fn copy_acl_from_template(profile: &mut sc_profile, file: &mut sc_file, name: &CStr) -> i32 {
+    let mut tmpl = null_mut();
+    let guard_tmpl = GuardFile::new(&raw mut tmpl);
+    let rv = me_profile_get_file(profile, name.as_ptr(), *guard_tmpl);
+    if rv != SC_SUCCESS || tmpl.is_null() { return SC_ERROR_INCONSISTENT_PROFILE; }
+    for op in 0..u32::try_from(SC_MAX_AC_OPS).unwrap_or(0) {
+        unsafe { sc_file_clear_acl_entries(file, op) };
+        let mut entry = unsafe { sc_file_get_acl_entry(tmpl, op) };
+        while !entry.is_null() {
+            let e = unsafe { &*entry };
+            let rv = unsafe { sc_file_add_acl_entry(file, op, e.method, e.key_ref.into()) };
+            if rv != SC_SUCCESS { return rv; }
+            entry = e.next;
+        }
+    }
+    SC_SUCCESS
+}
 
 /* e.g. pkcs15-init --store-secret-key aes_key_256.hex --secret-key-algorithm aes/256  --auth-id 01 --id 09 --verify-pin
  *      pkcs15-init --store-secret-key file            --secret-key-algorithm 3des     --auth-id 01 --id 02 --verify-pin
@@ -1133,9 +1202,20 @@ fn bn_fixed(bn: &sc_pkcs15_bignum, len: usize) -> Vec<u8> {
 }
 
 /* PUT KEY `80 DA` writing `data` at `offset` of the currently selected key EF, chunked at 0xFF.
-   Accepts SW 90 00 and 63 01 (pairwise consistency not yet confirmable). */
+   Accepts SW 90 00 and 63 01 (pairwise consistency not yet confirmable).
+   ACOS5-EVO: through the driver, which sends it in plain or under SM as the key EF and the SM mode decide. */
 fn acos5_put_key(card: &mut sc_card, offset: usize, data: &[u8]) -> i32 {
     let ctx = unsafe { &mut *card.ctx };
+    if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+        let Ok(off) = u16::try_from(offset) else { return SC_ERROR_INVALID_ARGUMENTS; };
+        let [hi, lo] = off.to_be_bytes();
+        let mut ctl = CardCtlEvoSmTransmit { cmd: [0x80, 0xDA, hi, lo], data: data.as_ptr(), data_len: data.len(), use_: 0, sw: 0 };
+        let rv = unsafe { sc_card_ctl(card, SC_CARDCTL_ACOS5_EVO_SM_TRANSMIT, (&raw mut ctl).cast::<c_void>()) };
+        log3if!(ctx,c"acos5_put_key",line!(), c"PUT KEY at offset %u, %zu bytes, %s, SW %04X", u32::from(off), data.len(),
+            [c"plain".as_ptr(), c"SM MAC only".as_ptr(), c"SM MAC and encryption".as_ptr()][usize::from(ctl.use_.min(2))],
+            u32::from(ctl.sw));
+        return rv;
+    }
     let mut pos = 0;
     while pos < data.len() {
         let end = (pos + 0xFF).min(data.len());
