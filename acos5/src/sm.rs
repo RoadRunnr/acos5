@@ -1228,16 +1228,18 @@ pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey
 ///   material never go in plain, neither as a plain APDU nor in a MAC-only `81` object. The card accepts only
 ///   the form its access condition dictates, so no command is forced into SM or into encryption.
 ///
-/// PSO DECIPHER is always plain: the card accepts the plain form on key EFs whose use condition asks for SM, and no
-/// SM form is known to work (tested with a real ACOS5-EVO card; the chained SM forms tried coded the `87` length
-/// as `81 xx` / `82 xx xx` and were refused; one-byte lengths were not tried).
+/// PSO DECIPHER follows the SCB like the other commands, but only encrypted: an SCB that requires SM with an SE
+/// record without a CT is an error, because the card refuses the encrypted form there (`69 87`) and no MAC-only form
+/// is known to work. It is not a secret command for mode `transmit`. The SM form is one wrapped command per chained
+/// block with one-byte `87` lengths (`evo_sm_transmit_chained`), tested with a real ACOS5-EVO card.
 ///
 /// # Errors
-/// `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` for mode `none` with an SCB that requires SM, and for mode
-/// `transmit` with a PIN or key command whose SCB does not require SM with encryption.
+/// `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` for mode `none` with an SCB that requires SM, for mode
+/// `transmit` with a PIN or key command whose SCB does not require SM with encryption, and for PSO DECIPHER
+/// with an SCB that requires SM with an SE record without a CT.
 pub(crate) fn evo_sm_use(mode: SmMode, scb: u8, has_ct: bool, cmd: SmCmd) -> Result<SmUse, i32> {
-    if cmd == SmCmd::Decipher { return Ok(SmUse::Plain); }
     let required = scb != 0xFF && (scb & 0x40) == 0x40;
+    if cmd == SmCmd::Decipher && required && !has_ct { return Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED); }
     let by_se = if has_ct { SmUse::MacEnc } else { SmUse::Mac };
     let secret = matches!(cmd, SmCmd::Verify | SmCmd::ChangePin | SmCmd::Unblock | SmCmd::PutKey);
     match mode {
@@ -1611,14 +1613,16 @@ mod tests_evo_sm {
     fn test_challenge() -> [u8; 16] { from_fn(|i| u8::try_from(16 + i).unwrap_or(0)) }
 
     #[test]
-    fn decipher_always_plain() {
-        /* the card accepts PSO DECIPHER in plain on key EFs whose SCB asks for SM and no SM form is known to work:
-           no mode sends it under SM, and transmit does not refuse it (it sends no secret) */
-        for mode in [SmMode::None, SmMode::Acl, SmMode::Transmit] {
-            for (scb, has_ct) in [(0x00, false), (0x01, false), (0x42, true), (0x45, false), (0x46, true)] {
-                assert_eq!(evo_sm_use(mode, scb, has_ct, SmCmd::Decipher), Ok(SmUse::Plain), "mode {mode:?}, SCB {scb:02X}");
-            }
+    fn decipher_follows_scb() {
+        /* PSO DECIPHER under SM is verified only encrypted: an SE record without a CT gives an error, never plain */
+        for mode in [SmMode::Acl, SmMode::Transmit] {
+            assert_eq!(evo_sm_use(mode, 0x01, false, SmCmd::Decipher), Ok(SmUse::Plain));
+            assert_eq!(evo_sm_use(mode, 0x42, true,  SmCmd::Decipher), Ok(SmUse::MacEnc));
+            assert_eq!(evo_sm_use(mode, 0xC2, true,  SmCmd::Decipher), Ok(SmUse::MacEnc));
+            assert_eq!(evo_sm_use(mode, 0x45, false, SmCmd::Decipher), Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED));
         }
+        assert_eq!(evo_sm_use(SmMode::None, 0xC2, true, SmCmd::Decipher), Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED));
+        assert_eq!(evo_sm_use(SmMode::None, 0x01, false, SmCmd::Decipher), Ok(SmUse::Plain));
     }
 
     #[test]
@@ -1736,20 +1740,23 @@ mod tests_evo_sm {
                                    SmCmd::PinStatus];
         const ERR: Result<SmUse, i32> = Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED);
         /* SCB 45: SE record 5 (CCT only), SCB 46: SE record 6 (CCT and CT) */
-        let rows: [Row<11>; 12] = [
+        let rows: [Row<11>; 15] = [
             //                           Read   Update Verify ChgPin Unblk  PutKey GenKey Sign   Decip  GetKey PinSt
             (SmMode::None,     0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
             (SmMode::None,     0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::None,     0x45, false, [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   Ok(P), ERR,   ERR  ]),
-            (SmMode::None,     0x46, true,  [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   Ok(P), ERR,   ERR  ]),
+            (SmMode::None,     0x45, false, [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
+            (SmMode::None,     0x46, true,  [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
+            (SmMode::None,     0xC2, true,  [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
             (SmMode::Acl,      0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
             (SmMode::Acl,      0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(P), Ok(M), Ok(M)]),
-            (SmMode::Acl,      0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(P), Ok(E), Ok(E)]),
+            (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), ERR,   Ok(M), Ok(M)]),
+            (SmMode::Acl,      0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
+            (SmMode::Acl,      0xC2, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
             (SmMode::Transmit, 0x00, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
             (SmMode::Transmit, 0x01, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
-            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), ERR,   ERR,   ERR,   ERR,   Ok(M), Ok(M), Ok(P), Ok(M), Ok(M)]),
-            (SmMode::Transmit, 0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(P), Ok(E), Ok(E)]),
+            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), ERR,   ERR,   ERR,   ERR,   Ok(M), Ok(M), ERR,   Ok(M), Ok(M)]),
+            (SmMode::Transmit, 0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
+            (SmMode::Transmit, 0xC2, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
         ];
         for (mode, scb, has_ct, expected) in rows {
             for (cmd, want) in CMDS.into_iter().zip(expected) {
