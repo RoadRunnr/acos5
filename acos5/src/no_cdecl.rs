@@ -96,7 +96,7 @@ use crate::se::{se_parse_sac, se_get_is_scb_suitable_for_sm_has_ct};
 use crate::path::{cut_path, file_id_from_cache_current_path, current_path_df, is_impossible_file_match};
 //use crate::missing_exports::me_get_max_recv_size;
 //use crate::cmd_card_info::is_pin_authenticated;
-use crate::sm::{SM_SMALL_CHALLENGE_LEN_u8, sm_common_read, sm_common_update};
+use crate::sm::{SM_SMALL_CHALLENGE_LEN_u8, sm_common_read, sm_common_update, evo_sm_decide, SmCmd, SmUse};
 use crate::crypto::{RAND_bytes, des_ecb3_unpadded_8, Encrypt};
 
 //use super::acos5_process_fci;/*, acos5_list_files, acos5_select_file, acos5_set_security_env*/
@@ -2449,6 +2449,17 @@ pub(crate) fn common_read(card: &mut sc_card,
             else   {c"No read_record will be done: The file has acl NEVER READ"},
                 SC_ERROR_SECURITY_STATUS_NOT_SATISFIED))
     }
+    else if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+        let cmd = if bin && [FDB_RSA_KEY_EF, FDB_ECC_KEY_EF].contains(&fdb) {SmCmd::GetKey} else {SmCmd::ReadFile};
+        match evo_file_sm_use(card, file_id, scb_read, cmd) {
+            Err(e) => Err(log3ifr_ret!(ctx,f,line!(), e)),
+            Ok(SmUse::Plain) => plain_read(card, idx, buf, flags, bin, fdb),
+            Ok(sm_use) => {
+                card.sm_ctx.info.cmd = SM_CMD_FILE_READ;
+                Ok(log3ifr_ret!(ctx,f,line!(), sm_common_read(card, idx, buf, flags, bin, sm_use == SmUse::MacEnc, fdb)))
+            },
+        }
+    }
     else if (scb_read & 0x40) == 0x40 {
         let res_se_sm = if (scb_read & 0x40) == 0x40 { se_get_is_scb_suitable_for_sm_has_ct
             (card, file_id, scb_read & 0x0F) } else { (false, false) };
@@ -2463,7 +2474,15 @@ pub(crate) fn common_read(card: &mut sc_card,
                     SC_ERROR_SECURITY_STATUS_NOT_SATISFIED))
         }
     }
-    else if bin && [FDB_RSA_KEY_EF, FDB_ECC_KEY_EF].contains(&fdb) {
+    else { plain_read(card, idx, buf, flags, bin, fdb) }
+} // common_read
+
+/* read without SM: key EFs with GET KEY, other files with READ BINARY / READ RECORD */
+fn plain_read(card: &mut sc_card, idx: u16, buf: &mut [u8], flags: c_ulong, bin: bool, fdb: u8) -> Result<i32, i32>
+{
+    let ctx = unsafe { &mut *card.ctx };
+    let f = if bin {c"common_read for acos5_read_binary"} else {c"common_read for acos5_read_record"};
+    if bin && [FDB_RSA_KEY_EF, FDB_ECC_KEY_EF].contains(&fdb) {
         card.cla = 0x80;
 ////println!("common_read for acos5_read_binary: buf.len(): {}, idx: {}", buf.len(), idx);
         #[expect(clippy::expect_used, reason = "..")]
@@ -2496,7 +2515,23 @@ pub(crate) fn common_read(card: &mut sc_card,
             }
         }
     } } }
-} // common_read
+} // plain_read
+
+/// ACOS5-EVO: how a command on file `file_id` with access condition `scb` is sent (see `evo_sm_use`).
+///
+/// # Errors
+/// `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` if the SCB references an SE record unusable for SM; as `evo_sm_decide`.
+pub(crate) fn evo_file_sm_use(card: &mut sc_card, file_id: u16, scb: u8, cmd: SmCmd) -> Result<SmUse, i32>
+{
+    let (suitable, has_ct) = if scb != 0xFF && (scb & 0x40) == 0x40 {
+        se_get_is_scb_suitable_for_sm_has_ct(card, file_id, scb & 0x0F) } else { (true, false) };
+    if !suitable {
+        let ctx = unsafe { &mut *card.ctx };
+        return Err(log3ifr_ret!(ctx, c"evo_file_sm_use", line!(),
+            c"The file's SM access condition references an SE record unusable for SM", SC_ERROR_SECURITY_STATUS_NOT_SATISFIED));
+    }
+    evo_sm_decide(card, scb, has_ct, cmd)
+}
 
 
 ///
@@ -2535,6 +2570,19 @@ pub(crate) fn common_update(card: &mut sc_card,
             else   {c"No update_record will be done: The file has acl NEVER UPDATE"},
             SC_ERROR_SECURITY_STATUS_NOT_SATISFIED)
     }
+    else if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+        if bin && fdb == FDB_RSA_KEY_EF { // key EFs are written with PUT KEY
+            return log3ifr_ret!(ctx,f,line!(), SC_ERROR_NO_CARD_SUPPORT);
+        }
+        match evo_file_sm_use(card, file_id, scb_update, SmCmd::UpdateFile) {
+            Err(e) => log3ifr_ret!(ctx,f,line!(), e),
+            Ok(SmUse::Plain) => plain_update(card, idx, buf, flags, bin),
+            Ok(sm_use) => {
+                card.sm_ctx.info.cmd = SM_CMD_FILE_UPDATE;
+                sm_common_update(card, idx, buf, flags, bin, sm_use == SmUse::MacEnc, fdb)
+            },
+        }
+    }
     else if (scb_update & 0x40) == 0x40 {
         let res_se_sm = if (scb_update & 0x40) == 0x40 { se_get_is_scb_suitable_for_sm_has_ct
             (card, file_id, scb_update & 0x0F) } else { (false, false) };
@@ -2552,7 +2600,16 @@ pub(crate) fn common_update(card: &mut sc_card,
     else if bin && fdb == FDB_RSA_KEY_EF { // no put_key support currently
         log3ifr_ret!(ctx,f,line!(), SC_ERROR_NO_CARD_SUPPORT)
     }
-    else { unsafe {
+    else { plain_update(card, idx, buf, flags, bin) }
+}
+
+/* update or append without SM */
+fn plain_update(card: &mut sc_card, idx: u16, buf: &[u8], flags: c_ulong, bin: bool) -> i32
+{
+    let ctx = unsafe { &mut *card.ctx };
+    let f = if bin {c"acos5_update_binary"}
+                   else if idx>0 {c"acos5_update_record"} else {c"acos5_append_record"};
+    unsafe {
         //#[expect(clippy::collapsible_else_if, reason = "..")]
         #[expect(clippy::expect_used, reason = "..")]
         if !bin && idx==0 && flags==0 {
@@ -2573,7 +2630,7 @@ pub(crate) fn common_update(card: &mut sc_card,
                             (card, u32::from(idx), 0, buf.as_ptr(), buf.len(), flags)) }
                     }
         }}
-    }}
+    }
 }
 
 

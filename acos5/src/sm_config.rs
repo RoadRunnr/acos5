@@ -67,7 +67,7 @@ impl KeySource {
 }
 
 /* overwrite in a way the compiler cannot drop as a dead store */
-fn wipe(buf: &mut [u8]) {
+pub(crate) fn wipe(buf: &mut [u8]) {
     for b in buf.iter_mut() {
         unsafe { std::ptr::write_volatile(b, 0) };
     }
@@ -101,9 +101,8 @@ impl std::fmt::Debug for EvoSmKeys {
 #[derive(Debug, Clone)]
 pub(crate) struct EvoSmConfig {
     pub(crate) mode: SmMode,
-    #[allow(dead_code)] // Task 7 reads it in the SM command paths
     pub(crate) keys: Option<EvoSmKeys>,
-    #[allow(dead_code)] // Task 7 reads it in the SM command paths
+    #[allow(dead_code)] // not used yet: the EVO SM uses the static keys
     pub(crate) session_keys: bool,
     pub(crate) key_source: KeySource,
     pub(crate) serial: [u8; 8],
@@ -302,7 +301,6 @@ pub(crate) fn evo_sm_config_free(p: *mut c_void) {
 /// # Errors
 /// As `resolve`; also if the serial cannot be read, the card is not an EVO (serial not 8 bytes) or the named
 /// block does not exist.
-#[allow(dead_code)] // Task 7 wires this into the SM command paths
 pub(crate) fn evo_sm_config(card: &mut sc_card) -> Result<EvoSmConfig, i32> {
     if card.ctx.is_null() || card.drv_data.is_null() { return Err(SC_ERROR_INVALID_ARGUMENTS); }
     {

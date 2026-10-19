@@ -37,6 +37,7 @@ use std::ptr::{null, null_mut};
 use std::slice::from_raw_parts;
 use std::time::Instant;
 use std::cmp::min;
+use std::cell::Cell;
 use function_name::named;
 use opensc_sys::opensc::{sc_context, sc_card, sc_hex_to_bin, sc_transmit_apdu,
                          sc_check_sw, sc_pin_cmd_data, SC_PIN_STATE_LOGGED_IN, SC_PIN_STATE_LOGGED_OUT,
@@ -47,21 +48,22 @@ use opensc_sys::types::{SC_APDU_CASE_4_SHORT, sc_aid, sc_path};
 use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_SM_KEYSET_NOT_FOUND, SC_ERROR_UNKNOWN_DATA_RECEIVED, SC_ERROR_INVALID_DATA,
                          SC_ERROR_SM_IFD_DATA_MISSING, SC_ERROR_SM_AUTHENTICATION_FAILED,
                          SC_ERROR_SM_NOT_INITIALIZED, SC_ERROR_SM, SC_ERROR_PIN_CODE_INCORRECT, SC_ERROR_AUTH_METHOD_BLOCKED,
-                         SC_ERROR_KEYPAD_MSG_TOO_LONG};
-    /*, SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_SECURITY_STATUS_NOT_SATISFIED, SC_ERROR_NOT_SUPPORTED*/
+                         SC_ERROR_KEYPAD_MSG_TOO_LONG, SC_ERROR_SECURITY_STATUS_NOT_SATISFIED};
+    /*, SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_NOT_SUPPORTED*/
 use opensc_sys::sm::{sm_info, SM_SMALL_CHALLENGE_LEN, SM_CMD_FILE_READ, SM_CMD_FILE_UPDATE, SM_CMD_PIN};
     /*, sm_cwa_session, SM_CMD_PIN_VERIFY, SM_CMD_FILE_CREATE, SM_CMD_FILE_DELETE, SM_CMD_FILE,*/
 use opensc_sys::log::sc_dump_hex; /*, SC_LOG_DEBUG_NORMAL, SC_LOG_DEBUG_SM*/
 use opensc_sys::scconf::{scconf_block, scconf_find_blocks, scconf_get_str};
 
 use crate::constants_types::{ACOS5_OBJECT_REF_LOCAL, ACOS5_OBJECT_REF_MAX, CARD_DRV_SHORT_NAME, DataPrivate, build_apdu,
-                             /*p_void,*/ SC_CARD_TYPE_ACOS5_EVO_V4, safe_int_try_from};
+                             /*p_void,*/ SC_CARD_TYPE_ACOS5_EVO_V4, FDB_RSA_KEY_EF, FDB_ECC_KEY_EF, safe_int_try_from};
 use crate::crypto::{DES_KEY_SZ, DES_KEY_SZ_u8, des_ecb3_unpadded_8, des_ede3_cbc_pad_80_mac, des_ede3_cbc_pad_80,
                     DES_set_odd_parity, DES_cblock, Encrypt, Decrypt};
 use crate::no_cdecl::{authenticate_external, authenticate_internal};
 use crate::wrappers::{wr_do_log, wr_do_log_t, wr_do_log_tttt, wr_do_log_tu,
                       wr_do_log_tuvw, wr_do_log_rv_ret, wr_do_log_sds_ret, wr_do_log_rv};
 use crate::tasn1_pkcs15_util::analyze_PKCS15_DIRRecord_2F00;
+use crate::sm_config::{evo_sm_config, wipe, SmMode};
 
 #[expect(clippy::as_conversions, reason = "..")]
 #[expect(clippy::cast_possible_truncation, reason = "we know, what we are doing here !")]
@@ -533,7 +535,7 @@ pub(crate) fn sm_common_read(card: &mut sc_card,
     let f = if bin {c"sm_read_binary"} else {c"sm_read_record"};
     log3if!(ctx,f,line!(), c"called with flags %zu", flags);
     if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
-        return evo_sm_common_read(card, idx, buf, bin);
+        return evo_sm_common_read(card, idx, buf, bin, fdb);
     }
 
     if sm_manage_keyset(card).is_err() || sm_manage_initialize(card).is_err() {
@@ -1174,7 +1176,7 @@ The EVO does not use the V2/V3 3DES session key scheme; per command:
     with CLA' = CLA ^ 0x0C and pad() = 0x80 00.. only if not already a multiple of 16
   * command data objects: 97 01 Le (expects response data), 81 L data (plain) or 87 L pi E(data)
   * response: [81 L data | 87 L pi E(data)] 99 02 SW1 SW2 8E 04 MAC, MAC over everything before 8E
-The key is the static AES key referenced by the SE record's CCT/CT (keyset_<aid>_02_enc in opensc.conf).
+The key is the static AES key referenced by the SE record's CCT/CT (key 82 from the card's SM configuration).
 Note: the challenge is not part of the MAC, so MAC-only commands could be replayed (card design).
 */
 use crate::crypto::{aes_cbc_nopad, aes_cmac, AES_BLOCK_SIZE};
@@ -1201,8 +1203,91 @@ fn evo_incr(b: &mut [u8; AES_BLOCK_SIZE]) {
     }
 }
 
-fn evo_sm_key(card: &sc_card) -> [u8; 3*DES_KEY_SZ] {
-    get_ck_enc_card(card) // 24 bytes from keyset_<aid>_02_enc: the AES-192 SM key
+/// How an ACOS5-EVO command is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SmUse { Plain, Mac, MacEnc }
+
+/// The ACOS5-EVO commands that can be sent under secure messaging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "the PIN, key and crypto commands are not sent under SM yet"))]
+pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey, GenerateKey, Sign, Decipher, GetKey }
+
+/// Decide whether a command is sent under SM, from the configured `mode`, the command's SCB and whether the
+/// SE record the SCB references has a CT (`has_ct`).
+///
+/// SCB `4n` requires SM per SE record n; SCB `FF` (never) does not count as SM.
+/// * `none`: never SM; an SCB that requires SM is an error.
+/// * `acl`: SM only where the SCB requires it, encrypted if the SE record has a CT.
+/// * `transmit`: SM for every command; PIN, key import and decipher data are always encrypted.
+///
+/// # Errors
+/// `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` for mode `none` with an SCB that requires SM.
+pub(crate) fn evo_sm_use(mode: SmMode, scb: u8, has_ct: bool, cmd: SmCmd) -> Result<SmUse, i32> {
+    let required = scb != 0xFF && (scb & 0x40) == 0x40;
+    let by_se = if has_ct { SmUse::MacEnc } else { SmUse::Mac };
+    match mode {
+        SmMode::None => if required { Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED) } else { Ok(SmUse::Plain) },
+        SmMode::Acl => Ok(if required { by_se } else { SmUse::Plain }),
+        SmMode::Transmit => Ok(match cmd {
+            SmCmd::Verify | SmCmd::ChangePin | SmCmd::Unblock | SmCmd::PutKey | SmCmd::Decipher => SmUse::MacEnc,
+            SmCmd::ReadFile | SmCmd::UpdateFile | SmCmd::GenerateKey | SmCmd::Sign | SmCmd::GetKey => by_se,
+        }),
+    }
+}
+
+thread_local! {
+    /* set while evo_sm_config reads its inputs from the card (EF.DIR for the AID) */
+    static EVO_SM_CONFIG_LOADING: Cell<bool> = const { Cell::new(false) };
+}
+
+struct ConfigLoading;
+
+impl ConfigLoading {
+    fn enter() -> Self { EVO_SM_CONFIG_LOADING.with(|l| l.set(true)); Self }
+}
+
+impl Drop for ConfigLoading {
+    fn drop(&mut self) { EVO_SM_CONFIG_LOADING.with(|l| l.set(false)); }
+}
+
+/// `evo_sm_use` with the card's configured mode. When SM is required but not possible, logs one line naming
+/// the card serial and the missing setting.
+///
+/// # Errors
+/// As `evo_sm_config` and `evo_sm_use`; `SC_ERROR_SM_KEYSET_NOT_FOUND` if SM is to be used but no keys resolve.
+pub(crate) fn evo_sm_decide(card: &mut sc_card, scb: u8, has_ct: bool, cmd: SmCmd) -> Result<SmUse, i32> {
+    if card.ctx.is_null() { return Err(SC_ERROR_SM); }
+    let ctx = unsafe { &mut *card.ctx };
+    let f = c"evo_sm_decide";
+    /* the configuration's own read of EF.DIR comes back here: it is read plain */
+    if EVO_SM_CONFIG_LOADING.with(Cell::get) {
+        return evo_sm_use(SmMode::None, scb, has_ct, cmd).map_err(|e| log3ifr_ret!(ctx,f,line!(), e));
+    }
+    let config = {
+        let _loading = ConfigLoading::enter();
+        evo_sm_config(card)?
+    };
+    let serial_c = CString::new(config.serial_hex()).unwrap_or_default();
+    match evo_sm_use(config.mode, scb, has_ct, cmd) {
+        Err(e) => {
+            log3if!(ctx,f,line!(), c"secure_messaging: card %s: the access condition requires SM, but mode is none; set mode",
+                serial_c.as_ptr());
+            Err(e)
+        },
+        Ok(SmUse::Plain) => Ok(SmUse::Plain),
+        Ok(_) if config.keys.is_none() => {
+            log3if!(ctx,f,line!(), c"secure_messaging: card %s: SM is required, but no keys are set; set a keyset or kmc",
+                serial_c.as_ptr());
+            Err(SC_ERROR_SM_KEYSET_NOT_FOUND)
+        },
+        Ok(sm_use) => Ok(sm_use),
+    }
+}
+
+/// The SM key (key 82, AES-192) from the card's configuration. The caller wipes it after use.
+fn evo_sm_key(card: &mut sc_card) -> Result<[u8; 3*DES_KEY_SZ], i32> {
+    let config = evo_sm_config(card)?;
+    config.keys.as_ref().map(|keys| keys.sm).ok_or(SC_ERROR_SM_KEYSET_NOT_FOUND)
 }
 
 /// Send one command to an ACOS5-EVO under secure messaging.
@@ -1212,10 +1297,18 @@ fn evo_sm_key(card: &sc_card) -> [u8; 3*DES_KEY_SZ] {
 fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8, out: &mut [u8])
     -> Result<usize, i32>
 {
+    let mut key = evo_sm_key(card)?;
+    let result = evo_sm_transmit_key(card, &key, cmd, data, encrypt, le, out);
+    wipe(&mut key);
+    result
+}
+
+fn evo_sm_transmit_key(card: &mut sc_card, key: &[u8; 3*DES_KEY_SZ], cmd: [u8; 4], data: &[u8], encrypt: bool, le: u8,
+                       out: &mut [u8]) -> Result<usize, i32>
+{
     if card.ctx.is_null() { return Err(SC_ERROR_SM); }
     let ctx = unsafe { &mut *card.ctx };
     let f = c"evo_sm_transmit";
-    let key = evo_sm_key(card);
 
     let mut ssc = [0_u8; AES_BLOCK_SIZE];
     let mut apdu = build_apdu(ctx, &[0, 0x84, 0, 0, 16], SC_APDU_CASE_2_SHORT, &mut ssc);
@@ -1233,7 +1326,7 @@ fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool,
         let mut padded = data.to_vec();
         evo_pad(&mut padded);
         let pi = u8::from(padded.len() != data.len());
-        let enc = aes_cbc_nopad(&padded, &key, &ssc, Encrypt);
+        let enc = aes_cbc_nopad(&padded, key, &ssc, Encrypt);
         dos.extend_from_slice(&[0x87, safe_int_try_from(enc.len() + 1), pi]);
         dos.extend_from_slice(&enc);
     }
@@ -1246,7 +1339,7 @@ fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool,
     let mut dos_padded = dos.clone();
     evo_pad(&mut dos_padded);
     mac_in.extend_from_slice(&dos_padded);
-    let mac = aes_cmac(&mac_in, &key);
+    let mac = aes_cmac(&mac_in, key);
 
     let mut sm_cmd = vec![cla, cmd[1], cmd[2], cmd[3], safe_int_try_from(dos.len() + 6)];
     sm_cmd.extend_from_slice(&dos);
@@ -1264,7 +1357,7 @@ fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool,
     let body = &resp[..resp.len()-6];
     let mut body_padded = body.to_vec();
     evo_pad(&mut body_padded);
-    if aes_cmac(&body_padded, &key)[..4] != resp[resp.len()-4..] {
+    if aes_cmac(&body_padded, key)[..4] != resp[resp.len()-4..] {
         return Err(log3ifr_ret!(ctx,f,line!(), c"Error: SM response MAC mismatch", SC_ERROR_SM));
     }
     evo_incr(&mut ssc);
@@ -1284,7 +1377,7 @@ fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool,
             },
             0x87 => {
                 if val.is_empty() || !(val.len()-1).is_multiple_of(AES_BLOCK_SIZE) { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
-                let dec = aes_cbc_nopad(&val[1..], &key, &ssc, Decrypt);
+                let dec = aes_cbc_nopad(&val[1..], key, &ssc, Decrypt);
                 let plain = if val[0] == 1 { evo_unpad(&dec).ok_or(SC_ERROR_SM)? } else { &dec[..] };
                 if plain.len() > out.len() { return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM)); }
                 out[..plain.len()].copy_from_slice(plain);
@@ -1301,15 +1394,15 @@ fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], encrypt: bool,
     Ok(plain_len)
 }
 
-fn evo_sm_common_read(card: &mut sc_card, idx: u16, buf: &mut [u8], bin: bool) -> i32 {
+/* key EFs (FDB 09, 19) are read with GET KEY 80 CA, other files with READ BINARY / READ RECORD */
+fn evo_sm_common_read(card: &mut sc_card, idx: u16, buf: &mut [u8], bin: bool, fdb: u8) -> i32 {
     if card.ctx.is_null() { return SC_ERROR_SM; }
     let ctx = unsafe { &mut *card.ctx };
-    let f = if bin {c"evo_sm_read_binary"} else {c"evo_sm_read_record"};
-    if sm_manage_keyset(card).is_err() {
-        return log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM_NOT_INITIALIZED);
-    }
+    let key_ef = bin && [FDB_RSA_KEY_EF, FDB_ECC_KEY_EF].contains(&fdb);
+    let f = if key_ef {c"evo_sm_get_key"} else if bin {c"evo_sm_read_binary"} else {c"evo_sm_read_record"};
     let count = min(buf.len(), EVO_SM_MAX_CHUNK);
-    let cmd = if bin { let [hi, lo] = idx.to_be_bytes(); [0, 0xB0, hi, lo] }
+    let cmd = if key_ef { let [hi, lo] = idx.to_be_bytes(); [0x80, 0xCA, hi, lo] }
+              else if bin { let [hi, lo] = idx.to_be_bytes(); [0, 0xB0, hi, lo] }
               else   { [0, 0xB2, safe_int_try_from(idx), 4] };
     match evo_sm_transmit(card, cmd, &[], false, safe_int_try_from(count), &mut buf[..count]) {
         Ok(n)  => log3ifr_ret!(ctx,f,line!(), safe_int_try_from::<usize, i32>(n)),
@@ -1317,19 +1410,17 @@ fn evo_sm_common_read(card: &mut sc_card, idx: u16, buf: &mut [u8], bin: bool) -
     }
 }
 
-fn evo_sm_common_update(card: &mut sc_card, idx: u16, buf: &[u8], flags: c_ulong, bin: bool, has_ct: bool) -> i32 {
+/* `encrypt`: the command data go as 87 (SmUse::MacEnc) */
+fn evo_sm_common_update(card: &mut sc_card, idx: u16, buf: &[u8], flags: c_ulong, bin: bool, encrypt: bool) -> i32 {
     if card.ctx.is_null() { return SC_ERROR_SM; }
     let ctx = unsafe { &mut *card.ctx };
     let f = if bin {c"evo_sm_update_binary"} else {c"evo_sm_update_record"};
-    if sm_manage_keyset(card).is_err() {
-        return log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM_NOT_INITIALIZED);
-    }
     let count = min(buf.len(), EVO_SM_MAX_CHUNK);
     let cmd = if bin { let [hi, lo] = idx.to_be_bytes(); [0, 0xD6, hi, lo] }
               else if idx == 0 && flags == 0 { [0, 0xE2, 0, 0] }
               else   { [0, 0xDC, safe_int_try_from(idx), 4] };
     let mut dummy = [0_u8; 0];
-    match evo_sm_transmit(card, cmd, &buf[..count], has_ct, 0, &mut dummy) {
+    match evo_sm_transmit(card, cmd, &buf[..count], encrypt, 0, &mut dummy) {
         Ok(_)  => log3ifr_ret!(ctx,f,line!(), safe_int_try_from::<usize, i32>(count)),
         Err(e) => log3ifr_ret!(ctx,f,line!(), e),
     }
@@ -1337,7 +1428,40 @@ fn evo_sm_common_update(card: &mut sc_card, idx: u16, buf: &[u8], flags: c_ulong
 
 #[cfg(test)]
 mod tests_evo_sm {
-    use super::{evo_incr, evo_pad, evo_unpad};
+    use opensc_sys::errors::SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
+    use crate::sm_config::SmMode;
+    use super::{evo_incr, evo_pad, evo_unpad, evo_sm_use, SmCmd, SmUse};
+
+    #[test]
+    fn evo_sm_use_table() {
+        use SmUse::{Plain as P, Mac as M, MacEnc as E};
+        const CMDS: [SmCmd; 10] = [SmCmd::ReadFile, SmCmd::UpdateFile, SmCmd::Verify, SmCmd::ChangePin, SmCmd::Unblock,
+                                   SmCmd::PutKey, SmCmd::GenerateKey, SmCmd::Sign, SmCmd::Decipher, SmCmd::GetKey];
+        const ERR: Result<SmUse, i32> = Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED);
+        /* SCB 45: SE record 5 (CCT only), SCB 46: SE record 6 (CCT and CT) */
+        let rows: [(SmMode, u8, bool, [Result<SmUse, i32>; 10]); 12] = [
+            //                           Read   Update Verify ChgPin Unblk  PutKey GenKey Sign   Decip  GetKey
+            (SmMode::None,     0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::None,     0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::None,     0x45, false, [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
+            (SmMode::None,     0x46, true,  [ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR,   ERR  ]),
+            (SmMode::Acl,      0x00, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::Acl,      0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M)]),
+            (SmMode::Acl,      0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
+            (SmMode::Transmit, 0x00, false, [Ok(M), Ok(M), Ok(E), Ok(E), Ok(E), Ok(E), Ok(M), Ok(M), Ok(E), Ok(M)]),
+            (SmMode::Transmit, 0x01, false, [Ok(M), Ok(M), Ok(E), Ok(E), Ok(E), Ok(E), Ok(M), Ok(M), Ok(E), Ok(M)]),
+            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), Ok(E), Ok(E), Ok(E), Ok(E), Ok(M), Ok(M), Ok(E), Ok(M)]),
+            (SmMode::Transmit, 0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
+        ];
+        for (mode, scb, has_ct, expected) in rows {
+            for (cmd, want) in CMDS.into_iter().zip(expected) {
+                assert_eq!(evo_sm_use(mode, scb, has_ct, cmd), want, "mode {mode:?}, SCB {scb:02X}, {cmd:?}");
+            }
+        }
+        /* SCB FF is NEVER, not SM with SE record 0F: no SM decision error for it */
+        assert_eq!(evo_sm_use(SmMode::None, 0xFF, false, SmCmd::ReadFile), Ok(P));
+    }
 
     #[test]
     fn padding_and_ssc() {

@@ -521,7 +521,7 @@ use no_cdecl::{select_file_by_path, enum_dir,
     ACL_CATEGORY_DF_MF, ACL_CATEGORY_EF_CHV, ACL_CATEGORY_KEY, ACL_CATEGORY_SE,
     get_is_running_compute_signature, set_is_running_compute_signature, algo_ref_sym_store,
     common_read, common_update, acos5_supported_ec_curves, logout_pin, sym_en_decrypt,
-    algo_ref_mse_sedo
+    algo_ref_mse_sedo, evo_file_sm_use
 };
 
 mod path;
@@ -534,7 +534,7 @@ mod se;
 use se::{map_scb8_to_acl, se_get_is_scb_suitable_for_sm_has_ct, se_parse_sae, se_get_sae_scb};
 
 mod sm;
-use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy};
+use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy, SmCmd, SmUse};
 
 mod sm_config;
 use sm_config::evo_sm_config_free;
@@ -3155,6 +3155,15 @@ fn acos5_read_public_key(card: &mut sc_card, ctx: &mut sc_context,
         return Err(rv);
     }
 
+    /* ACOS5-EVO: under SM, read_binary sends GET KEY in SM short chunks */
+    let sm_use = if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 && (card.caps & SC_CARD_CAP_APDU_EXT) != 0 {
+        let file_id = file_id_from_cache_current_path(card);
+        let dp = unsafe { Box::from_raw(card.drv_data.cast::<DataPrivate>()) };
+        let scb_read = dp.files.get(&file_id).and_then(|x| x.2).map_or(0xFF, |scb8| scb8[0]);
+        let _unused = Box::leak(dp);
+        evo_file_sm_use(card, file_id, scb_read, SmCmd::GetKey).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?
+    } else { SmUse::Plain };
+
     let mut rbuf = [0; RSAPUB_MAX_LEN];
     rv = unsafe { cfg_select! {
         any(v0_20_0, v0_21_0, v0_22_0, v0_23_0) => {
@@ -3162,7 +3171,9 @@ fn acos5_read_public_key(card: &mut sc_card, ctx: &mut sc_context,
         }
         _ => {
             let mut flags : c_ulong = 0;
-            if (card.caps & SC_CARD_CAP_APDU_EXT) == 0 { sc_read_binary(card, 0, rbuf.as_mut_ptr(), le_total, &raw mut flags) }
+            if (card.caps & SC_CARD_CAP_APDU_EXT) == 0 || sm_use != SmUse::Plain {
+                sc_read_binary(card, 0, rbuf.as_mut_ptr(), le_total, &raw mut flags)
+            }
             else {
                 /* ACOS5-EVO rejects an extended Le for Get Key (67 00): read in short chunks of max. 0xFF bytes,
                    P1 P2 = offset */
