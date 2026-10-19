@@ -536,6 +536,9 @@ use se::{map_scb8_to_acl, se_get_is_scb_suitable_for_sm_has_ct, se_parse_sae, se
 mod sm;
 use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy};
 
+mod sm_config;
+use sm_config::evo_sm_config_free;
+
 cfg_select! {
 not(target_os = "windows") => {
     mod tasn1_pkcs15_array;
@@ -1157,6 +1160,7 @@ cfg_select! {
             aid: sc_aid{value: [0; SC_MAX_AID_SIZE], len: 0}}, current_ef: null_mut(), current_df: null_mut(), valid: 1},
         #[cfg(iup_user_consent)]
         ui_ctx: ui_context::default(),
+        sm_config: null_mut(),
     } );
 
 /*
@@ -1517,6 +1521,7 @@ println!("sc_update_binary: rv: {}", rv);
         _ => {}
     }
 
+    evo_sm_config_free(dp.sm_config);
     drop(dp);
     card.drv_data = null_mut();
     Ok(log3ifr_ret!(ctx,f,line!(), SC_SUCCESS))

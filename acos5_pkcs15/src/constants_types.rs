@@ -859,6 +859,9 @@ pub(crate) struct DataPrivate { // see settings in acos5_init
     pub card_cache : sc_card_cache,
     #[cfg(iup_user_consent)]
     pub ui_ctx : ui_context,
+    /* the driver's cached secure messaging settings (Box<EvoSmConfig> from sm_config.rs) or null;
+       an opaque pointer, so that this shared file also builds in acos5_pkcs15; freed in acos5's finish */
+    pub sm_config : *mut c_void,
 }
 
 

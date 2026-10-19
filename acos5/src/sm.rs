@@ -59,7 +59,7 @@ use crate::constants_types::{ACOS5_OBJECT_REF_LOCAL, ACOS5_OBJECT_REF_MAX, CARD_
 use crate::crypto::{DES_KEY_SZ, DES_KEY_SZ_u8, des_ecb3_unpadded_8, des_ede3_cbc_pad_80_mac, des_ede3_cbc_pad_80,
                     DES_set_odd_parity, DES_cblock, Encrypt, Decrypt};
 use crate::no_cdecl::{authenticate_external, authenticate_internal};
-use crate::wrappers::{wr_do_log, wr_do_log_t, wr_do_log_tttt, wr_do_log_tu, wr_do_log_tuv,
+use crate::wrappers::{wr_do_log, wr_do_log_t, wr_do_log_tttt, wr_do_log_tu,
                       wr_do_log_tuvw, wr_do_log_rv_ret, wr_do_log_sds_ret, wr_do_log_rv};
 use crate::tasn1_pkcs15_util::analyze_PKCS15_DIRRecord_2F00;
 
@@ -192,8 +192,7 @@ fn sm_cwa_config_get_keyset(ctx: &mut sc_context, sm_info: &mut sm_info) -> Resu
         return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM_KEYSET_NOT_FOUND));
     }
 
-////            sc_debug(ctx, SC_LOG_DEBUG_NORMAL, "keyset::enc(%"SC_FORMAT_LEN_SIZE_T"u) %s", strlen(value), value);
-    log3if!(ctx,f,line!(), c"keyset::enc(%zu) %s", unsafe { strlen(value) }, value);
+    log3if!(ctx,f,line!(), c"%s: value of %zu characters", name.as_ptr(), unsafe { strlen(value) });
     if unsafe { strlen(value) } == 3*DES_KEY_SZ {
         cwa_keyset.enc.copy_from_slice(unsafe { from_raw_parts(value.cast::<u8>(), 2*DES_KEY_SZ) });
         cwa_session.icc.k[..DES_KEY_SZ].copy_from_slice(unsafe { from_raw_parts(
@@ -203,21 +202,18 @@ fn sm_cwa_config_get_keyset(ctx: &mut sc_context, sm_info: &mut sm_info) -> Resu
         hex_len = hex.len();
         rv = unsafe { sc_hex_to_bin(value, hex.as_mut_ptr(), &raw mut hex_len) };
         if rv != SC_SUCCESS {
-////sc_debug(ctx, SC_LOG_DEBUG_VERBOSE, "SM get %s: hex to bin failed for '%s'; error %i", name, value, rv);
-            log3if!(ctx,f,line!(), c"SM get %s: hextobin failed for '%s'; error %i", name.as_ptr(),value,rv);
+            log3if!(ctx,f,line!(), c"SM get %s: hextobin failed; error %i", name.as_ptr(), rv);
             return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_UNKNOWN_DATA_RECEIVED));
         }
 
-////sc_debug(ctx, SC_LOG_DEBUG_NORMAL, "ENC(%"SC_FORMAT_LEN_SIZE_T"u) %s", hex_len, sc_dump_hex(hex, hex_len));
-        log3if!(ctx,f,line!(), c"ENC(%zu) %s", hex_len, unsafe {sc_dump_hex(hex.as_ptr(), hex_len)});
+        log3if!(ctx,f,line!(), c"%s: %zu bytes after hex decoding", name.as_ptr(), hex_len);
         if hex_len != 3*DES_KEY_SZ {
             return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_INVALID_DATA));
         }
         cwa_keyset.enc.copy_from_slice(&hex[..2*DES_KEY_SZ]);
         cwa_session.icc.k[..DES_KEY_SZ].copy_from_slice(&hex[2*DES_KEY_SZ..3*DES_KEY_SZ]);
     }
-////            sc_debug(ctx, SC_LOG_DEBUG_NORMAL, "%s %s", name, sc_dump_hex(cwa_keyset->enc, 2*DES_KEY_SZ));
-    log3if!(ctx,f,line!(), c"%s %s",name.as_ptr(),unsafe{sc_dump_hex(cwa_keyset.enc.as_ptr(), 2*DES_KEY_SZ)});
+    log3if!(ctx,f,line!(), c"%s: key of %zu bytes set", name.as_ptr(), 3*DES_KEY_SZ);
 
     /* Keyset MAC */
     if sm_info.current_aid.len>0 && (safe_int_try_from::<u32,u8>(crt_at.refs[0]) & ACOS5_OBJECT_REF_LOCAL) >0 {
@@ -238,8 +234,7 @@ fn sm_cwa_config_get_keyset(ctx: &mut sc_context, sm_info: &mut sm_info) -> Resu
         return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_SM_KEYSET_NOT_FOUND));
     }
 
-////sc_debug(ctx, SC_LOG_DEBUG_NORMAL, "keyset::mac(%"SC_FORMAT_LEN_SIZE_T"u) %s", strlen(value), value);
-    log3if!(ctx,f,line!(), c"keyset::mac(%zu) %s", unsafe { strlen(value) }, value);
+    log3if!(ctx,f,line!(), c"%s: value of %zu characters", name.as_ptr(), unsafe { strlen(value) });
     if unsafe { strlen(value) } == 3*DES_KEY_SZ {
         cwa_keyset.mac.copy_from_slice(unsafe { from_raw_parts(value.cast::<u8>(), 2*DES_KEY_SZ) });
         cwa_session.ifd.k[..DES_KEY_SZ].copy_from_slice(unsafe {
@@ -249,13 +244,11 @@ fn sm_cwa_config_get_keyset(ctx: &mut sc_context, sm_info: &mut sm_info) -> Resu
         hex_len = hex.len();
         rv = unsafe { sc_hex_to_bin(value, hex.as_mut_ptr(), &raw mut hex_len) };
         if rv != SC_SUCCESS {
-////sc_debug(ctx, SC_LOG_DEBUG_VERBOSE, "SM get '%s': hex to bin failed for '%s'; error %i", name, value, rv);
-            log3if!(ctx,f,line!(), c"SM get %s: hextobin failed for '%s'; error %i",name.as_ptr(), value, rv);
+            log3if!(ctx,f,line!(), c"SM get %s: hextobin failed; error %i", name.as_ptr(), rv);
             return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_UNKNOWN_DATA_RECEIVED));
         }
 
-////sc_debug(ctx, SC_LOG_DEBUG_NORMAL, "MAC(%"SC_FORMAT_LEN_SIZE_T"u) %s", hex_len, sc_dump_hex(hex, hex_len));
-        log3if!(ctx,f,line!(), c"MAC(%zu) %s", hex_len, unsafe {sc_dump_hex(hex.as_ptr(), hex_len)});
+        log3if!(ctx,f,line!(), c"%s: %zu bytes after hex decoding", name.as_ptr(), hex_len);
         if hex_len != 3*DES_KEY_SZ {
             return Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_INVALID_DATA));
         }
@@ -263,8 +256,7 @@ fn sm_cwa_config_get_keyset(ctx: &mut sc_context, sm_info: &mut sm_info) -> Resu
         cwa_keyset.mac.copy_from_slice(&hex[..2*DES_KEY_SZ]);
         cwa_session.ifd.k[..DES_KEY_SZ].copy_from_slice(&hex[2*DES_KEY_SZ..3*DES_KEY_SZ]);
     }
-//sc_debug(ctx, SC_LOG_DEBUG_NORMAL, "%s %s", name, sc_dump_hex(cwa_keyset->mac, 2*DES_KEY_SZ));
-    log3if!(ctx,f,line!(), c"%s %s",name.as_ptr(),unsafe{sc_dump_hex(cwa_keyset.mac.as_ptr(), 2*DES_KEY_SZ)});
+    log3if!(ctx,f,line!(), c"%s: key of %zu bytes set", name.as_ptr(), 3*DES_KEY_SZ);
 
     cwa_keyset.sdo_reference = crt_at.refs[0];
 
@@ -398,6 +390,40 @@ fn sm_dur(cmd: u32) -> u128
     }
 }
 
+/// Set `card.sm_ctx.info.current_aid` from EF.DIR if it is not yet known; the current path stays selected.
+#[named]
+pub(crate) fn sm_ensure_current_aid(card: &mut sc_card) -> Result<(), i32>
+{
+    if card.ctx.is_null() { return Err(-1) }
+    #[cfg(not(target_os = "windows"))]
+    if card.sm_ctx.info.current_aid.len == 0 {
+        let ctx = unsafe { &mut *card.ctx };
+        let f_cstr = CString::new(function_name!()).map_err(|_x| -1)?;
+        let f = f_cstr.as_c_str();
+        let dp = unsafe { Box::from_raw(card.drv_data.cast::<DataPrivate>()) };
+        if dp.pkcs15_definitions.is_null() { let _unused = Box::leak(dp); return Err(-1) }
+        let curr_path : sc_path = cfg_select! {
+            any(v0_20_0, v0_21_0, v0_22_0, v0_23_0, v0_24_0, v0_25_0, v0_25_1, v0_26_0, v0_26_1) =>
+                 { card.cache.current_path }
+            _ => { dp.card_cache.current_path }
+        };
+        let _unused = Box::leak(dp);
+
+        let mut aid = sc_aid::default();
+        let res = analyze_PKCS15_DIRRecord_2F00(card, &mut aid);
+        if !res.unwrap_or(false) {
+            return Err(log3ifr_ret!(ctx,f,line!(), -1));
+        }
+        //println!("AID: {:X?}", &aid.value[..aid.len]);
+        card.sm_ctx.info.current_aid = aid;
+        let rv = unsafe { sc_select_file(card, &raw const curr_path, null_mut()) };
+        if rv != SC_SUCCESS {
+            return Err(log3ifr_ret!(ctx,f,line!(), rv));
+        }
+    }
+    Ok(())
+}
+
 #[named]
 fn sm_manage_keyset(card: &mut sc_card) -> Result<(), i32>
 {
@@ -411,31 +437,7 @@ fn sm_manage_keyset(card: &mut sc_card) -> Result<(), i32>
         Ok(())
     }
     else {
-/* */
-        #[cfg(not(target_os = "windows"))]
-        if card.sm_ctx.info.current_aid.len == 0 {
-            let dp = unsafe { Box::from_raw(card.drv_data.cast::<DataPrivate>()) };
-            if dp.pkcs15_definitions.is_null() { let _unused = Box::leak(dp); return Err(-1) }
-            let curr_path : sc_path = cfg_select! {
-                any(v0_20_0, v0_21_0, v0_22_0, v0_23_0, v0_24_0, v0_25_0, v0_25_1, v0_26_0, v0_26_1) =>
-                     { card.cache.current_path }
-                _ => { dp.card_cache.current_path }
-            };
-            let _unused = Box::leak(dp);
-
-            let mut aid = sc_aid::default();
-            let res = analyze_PKCS15_DIRRecord_2F00(card, &mut aid);
-            if !res.unwrap_or(false) {
-                return Err(log3ifr_ret!(ctx,f,line!(), -1));
-            }
-            //println!("AID: {:X?}", &aid.value[..aid.len]);
-            card.sm_ctx.info.current_aid = aid;
-            let rv = unsafe { sc_select_file(card, &raw const curr_path, null_mut()) };
-            if rv != SC_SUCCESS {
-                return Err(log3ifr_ret!(ctx,f,line!(), rv));
-            }
-        }
-/* */
+        sm_ensure_current_aid(card)?;
         log3if!(ctx,f,line!(), c"Current AID: %s",
             unsafe { sc_dump_hex(card.sm_ctx.info.current_aid.value.as_ptr(), card.sm_ctx.info.current_aid.len) });
 
