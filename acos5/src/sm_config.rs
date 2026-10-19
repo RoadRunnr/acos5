@@ -18,6 +18,10 @@ The card_driver block names one SM block with `secure_messaging = <name>`:
 Each setting resolves from the card sub-block, then the block, then the default. Keys resolve in the order
 card keyset, card kmc, block keyset, block kmc. Without a named block, the old keyset entries in the
 card_driver block still apply, with mode acl. In mode none an invalid key setting is logged and ignored.
+
+The keyset entries are named after the application's AID, the DF name (tag 84) of the application DF from
+its SELECT response. As long as that DF has not been selected the AID is unknown: mode and kmc still
+resolve, the keyset entries are skipped, and the settings resolve again once the AID is known.
 */
 
 use std::ffi::{CStr, CString};
@@ -25,14 +29,15 @@ use std::os::raw::{c_char, c_void};
 use std::ptr::{null, null_mut};
 
 use libc::free;
-use opensc_sys::opensc::{sc_card, sc_context};
-use opensc_sys::errors::{SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_INVALID_DATA, SC_ERROR_NOT_SUPPORTED};
+use opensc_sys::opensc::{sc_card, sc_context, sc_select_file, sc_get_mf_path};
+use opensc_sys::types::{sc_aid, sc_file, sc_path};
+use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_INTERNAL, SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_INVALID_DATA,
+                         SC_ERROR_NOT_SUPPORTED};
 use opensc_sys::scconf::{scconf_block, scconf_find_blocks, scconf_get_str};
 
 use crate::cmd_card_info::serial_no;
-use crate::constants_types::{CARD_DRV_SHORT_NAME, DataPrivate};
+use crate::constants_types::{CARD_DRV_SHORT_NAME, DataPrivate, FDB_DF, GuardFile};
 use crate::crypto::kbkdf_cmac;
-use crate::sm::sm_ensure_current_aid;
 use crate::wrappers::{wr_do_log, wr_do_log_t, wr_do_log_tuv, wr_do_log_rv_ret};
 
 const KEY_LEN: usize = 24;
@@ -108,6 +113,8 @@ pub(crate) struct EvoSmConfig {
     pub(crate) serial: [u8; 8],
     /// In mode `none`: the invalid key setting that was ignored (its entry name, never the value).
     pub(crate) ignored_setting: Option<String>,
+    /// The AID was known, so the keyset entries were looked up.
+    pub(crate) aid_known: bool,
 }
 
 impl EvoSmConfig {
@@ -222,12 +229,16 @@ fn keys_from_kmc(value: String, serial: &[u8; 8]) -> Result<EvoSmKeys, i32> {
 /// for a keyset or `kmc` that is not hex of the right length, or a keyset without its partner.
 /// No keys is not an error: `keys` is `None` then. In mode `none` an invalid key setting is not an error
 /// either: `keys` is `None` and `ignored_setting` names the entry.
+/// An empty `aid` is not an error: the keyset entries, which are named after the AID, are skipped.
 pub(crate) fn resolve(lookup: &dyn Fn(Option<&str>, &str) -> Option<String>, serial: &[u8; 8], aid: &[u8],
                       legacy: &dyn Fn(&str) -> Option<String>) -> Result<EvoSmConfig, i32>
 {
     let serial_hex = serial_hex(serial);
     let card = |key: &str| lookup(Some(&serial_hex), key);
     let setting = |key: &str| card(key).or_else(|| lookup(None, key));
+    let aid_known = !aid.is_empty();
+    let aid_keyset = |get: &dyn Fn(&str) -> Option<String>, allow_raw: bool|
+        if aid_known { keyset(get, aid, allow_raw) } else { Ok(None) };
 
     let mode = setting("mode").map(|v| parse_mode(&v)).transpose()?;
     let session_keys = setting("session_keys").map(|v| parse_bool(&v)).transpose()?.unwrap_or(false);
@@ -238,19 +249,19 @@ pub(crate) fn resolve(lookup: &dyn Fn(Option<&str>, &str) -> Option<String>, ser
     let block_entry = |entry: String| format!("{entry} in the block");
     /* card level before block level; within a level the keyset before kmc */
     let found = (|| -> Result<(Option<EvoSmKeys>, KeySource), (KeyError, KeySource)> {
-        if let Some(keys) = keyset(&card, aid, false).map_err(|(e, n)| ((e, card_entry(n)), KeySource::CardKeyset))? {
+        if let Some(keys) = aid_keyset(&card, false).map_err(|(e, n)| ((e, card_entry(n)), KeySource::CardKeyset))? {
             return Ok((Some(keys), KeySource::CardKeyset));
         }
         if let Some(v) = card("kmc") {
             return kmc(v, card_entry("kmc".into())).map(|k| (Some(k), KeySource::CardKmc)).map_err(|e| (e, KeySource::CardKmc));
         }
-        if let Some(keys) = keyset(&block, aid, false).map_err(|(e, n)| ((e, block_entry(n)), KeySource::BlockKeyset))? {
+        if let Some(keys) = aid_keyset(&block, false).map_err(|(e, n)| ((e, block_entry(n)), KeySource::BlockKeyset))? {
             return Ok((Some(keys), KeySource::BlockKeyset));
         }
         if let Some(v) = block("kmc") {
             return kmc(v, block_entry("kmc".into())).map(|k| (Some(k), KeySource::BlockKmc)).map_err(|e| (e, KeySource::BlockKmc));
         }
-        if let Some(keys) = keyset(legacy, aid, true).map_err(|(e, n)| ((e, format!("{n} in card_driver")), KeySource::Legacy))? {
+        if let Some(keys) = aid_keyset(legacy, true).map_err(|(e, n)| ((e, format!("{n} in card_driver")), KeySource::Legacy))? {
             return Ok((Some(keys), KeySource::Legacy));
         }
         Ok((None, KeySource::None))
@@ -260,11 +271,12 @@ pub(crate) fn resolve(lookup: &dyn Fn(Option<&str>, &str) -> Option<String>, ser
     let mode_for = |source: KeySource| mode.unwrap_or(if source == KeySource::Legacy { SmMode::Acl } else { SmMode::None });
     match found {
         Ok((keys, key_source)) =>
-            Ok(EvoSmConfig { mode: mode_for(key_source), keys, session_keys, key_source, serial: *serial, ignored_setting: None }),
+            Ok(EvoSmConfig { mode: mode_for(key_source), keys, session_keys, key_source, serial: *serial, ignored_setting: None,
+                             aid_known }),
         /* mode none never uses keys, so an invalid key setting is only reported */
         Err(((_, entry), source)) if mode_for(source) == SmMode::None =>
             Ok(EvoSmConfig { mode: SmMode::None, keys: None, session_keys, key_source: KeySource::None, serial: *serial,
-                             ignored_setting: Some(entry) }),
+                             ignored_setting: Some(entry), aid_known }),
         Err(((e, _), _)) => Err(e),
     }
 }
@@ -296,28 +308,30 @@ pub(crate) fn evo_sm_config_free(p: *mut c_void) {
 
 /// Read the SM settings of `card` from opensc.conf: the block that `secure_messaging` in
 /// `card_driver acos5_external` names, its `card <serial>` sub-block, or the old keyset entries.
-/// The result is cached for the lifetime of the card handle.
+/// The AID is `card.sm_ctx.info.current_aid`; this function sends no command for it. The result is cached
+/// for the lifetime of the card handle; a result resolved without the AID is resolved again once it is known.
 ///
 /// # Errors
 /// As `resolve`; also if the serial cannot be read, the card is not an EVO (serial not 8 bytes) or the named
-/// block does not exist.
+/// block does not exist. An unknown AID is not an error.
 pub(crate) fn evo_sm_config(card: &mut sc_card) -> Result<EvoSmConfig, i32> {
     if card.ctx.is_null() || card.drv_data.is_null() { return Err(SC_ERROR_INVALID_ARGUMENTS); }
+    let aid = card.sm_ctx.info.current_aid;
+    let aid = &aid.value[..aid.len.min(aid.value.len())];
     {
         let dp = unsafe { &*card.drv_data.cast::<DataPrivate>() };
         if !dp.sm_config.is_null() {
-            return Ok(unsafe { &*dp.sm_config.cast::<EvoSmConfig>() }.clone());
+            let cached = unsafe { &*dp.sm_config.cast::<EvoSmConfig>() };
+            if cached.aid_known || aid.is_empty() { return Ok(cached.clone()); }
         }
     }
     let ctx = unsafe { &mut *card.ctx };
     let f = c"evo_sm_config";
 
-    let serialnr = serial_no(card).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
+    /* serial_no returns -1 only for an internal failure */
+    let serialnr = serial_no(card).map_err(|e| log3ifr_ret!(ctx,f,line!(), if e == -1 {SC_ERROR_INTERNAL} else {e}))?;
     let serial: [u8; 8] = serialnr.value.get(..serialnr.len).and_then(|s| s.try_into().ok())
         .ok_or_else(|| log3ifr_ret!(ctx,f,line!(), SC_ERROR_NOT_SUPPORTED))?;
-    sm_ensure_current_aid(card).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
-    let aid = card.sm_ctx.info.current_aid;
-    let aid = &aid.value[..aid.len];
 
     let drv_block = find_block(ctx, c"card_driver", CARD_DRV_SHORT_NAME.as_ptr());
     let sm_name = get_str(drv_block, "secure_messaging");
@@ -349,6 +363,9 @@ pub(crate) fn evo_sm_config(card: &mut sc_card) -> Result<EvoSmConfig, i32> {
     let serial_c = CString::new(config.serial_hex()).unwrap_or_default();
     log3if!(ctx,f,line!(), c"secure_messaging: card %s, mode %s, keys from %s", serial_c.as_ptr(),
         config.mode.name().as_ptr(), config.key_source.name().as_ptr());
+    if !config.aid_known {
+        log3if!(ctx,f,line!(), c"secure_messaging: AID not known yet, keyset entries skipped");
+    }
     if let Some(ref entry) = config.ignored_setting {
         let entry_c = CString::new(entry.as_str()).unwrap_or_default();
         log3if!(ctx,f,line!(), c"secure_messaging: mode none, ignoring the invalid setting %s", entry_c.as_ptr());
@@ -358,12 +375,59 @@ pub(crate) fn evo_sm_config(card: &mut sc_card) -> Result<EvoSmConfig, i32> {
     }
 
     let dp = unsafe { &mut *card.drv_data.cast::<DataPrivate>() };
+    evo_sm_config_free(dp.sm_config);
     dp.sm_config = Box::into_raw(Box::new(config.clone())).cast::<c_void>();
     Ok(config)
 }
 
+/// The DF name (tag 84) of a DF that the driver keeps as the SM AID: an EVO DF other than the MF.
+pub(crate) fn evo_sm_note_df_name(card: &mut sc_card, file: &sc_file) {
+    if card.sm_ctx.info.current_aid.len == 0 && file.id != 0x3F00 && file.namelen > 0 && file.namelen <= file.name.len() {
+        let mut aid = sc_aid::default();
+        aid.value[..file.namelen].copy_from_slice(&file.name[..file.namelen]);
+        aid.len = file.namelen;
+        card.sm_ctx.info.current_aid = aid;
+    }
+}
+
+/// Find the AID without reading any file: SELECT the DFs below the MF until one returns a DF name, then
+/// SELECT the previous path again. Returns whether the AID is known.
+pub(crate) fn evo_sm_find_aid(card: &mut sc_card) -> bool {
+    if card.sm_ctx.info.current_aid.len > 0 { return true; }
+    if card.ctx.is_null() || card.drv_data.is_null() { return false; }
+    let ctx = unsafe { &mut *card.ctx };
+    let f = c"evo_sm_find_aid";
+    let (curr_path, mut dfs) = {
+        let dp = unsafe { &*card.drv_data.cast::<DataPrivate>() };
+        let curr_path : sc_path = cfg_select! {
+            any(v0_20_0, v0_21_0, v0_22_0, v0_23_0, v0_24_0, v0_25_0, v0_25_1, v0_26_0, v0_26_1) =>
+                 { card.cache.current_path }
+            _ => { dp.card_cache.current_path }
+        };
+        let dfs: Vec<u16> = dp.files.iter().filter(|(_, v)| v.1[0] == FDB_DF).map(|(id, _)| *id).collect();
+        (curr_path, dfs)
+    };
+    dfs.sort_unstable();
+    for fid in dfs {
+        let mut path = unsafe { *sc_get_mf_path() };
+        path.value[path.len..path.len+2].copy_from_slice(&fid.to_be_bytes());
+        path.len += 2;
+        let mut file = null_mut();
+        let guard_file = GuardFile::new(&raw mut file);
+        if unsafe { sc_select_file(card, &raw const path, *guard_file) } == SC_SUCCESS && !file.is_null() {
+            evo_sm_note_df_name(card, unsafe { &*file });
+        }
+        if card.sm_ctx.info.current_aid.len > 0 { break; }
+    }
+    if curr_path.len > 0 && unsafe { sc_select_file(card, &raw const curr_path, null_mut()) } != SC_SUCCESS {
+        log3if!(ctx,f,line!(), c"could not select the previous path again");
+    }
+    card.sm_ctx.info.current_aid.len > 0
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use opensc_sys::errors::{SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_INVALID_DATA};
     use super::{resolve, EvoSmConfig, KeySource, SmMode};
@@ -399,10 +463,17 @@ mod tests {
             let _unused = self.legacy.insert(key.into(), value.into());
             self
         }
-        fn resolve(&self) -> Result<EvoSmConfig, i32> {
-            let lookup = |serial: Option<&str>, key: &str| self.main.get(&(serial.map(String::from), key.into())).cloned();
-            let legacy = |key: &str| self.legacy.get(key).cloned();
-            resolve(&lookup, &SERIAL, AID, &legacy)
+        fn resolve(&self) -> Result<EvoSmConfig, i32> { self.resolve_aid(AID).0 }
+        /* also returns every entry name that was looked up */
+        fn resolve_aid(&self, aid: &[u8]) -> (Result<EvoSmConfig, i32>, Vec<String>) {
+            let asked = RefCell::new(Vec::new());
+            let lookup = |serial: Option<&str>, key: &str| {
+                asked.borrow_mut().push(key.to_string());
+                self.main.get(&(serial.map(String::from), key.into())).cloned()
+            };
+            let legacy = |key: &str| { asked.borrow_mut().push(key.to_string()); self.legacy.get(key).cloned() };
+            let result = resolve(&lookup, &SERIAL, aid, &legacy);
+            (result, asked.into_inner())
         }
     }
 
@@ -502,6 +573,44 @@ mod tests {
         assert_eq!(c.mode, SmMode::Acl);
         assert!(c.keys.is_none());
         assert_eq!(c.key_source, KeySource::None);
+    }
+
+    #[test]
+    fn mode_resolves_without_aid() {
+        let conf = Conf::new().block("mode", "transmit").card("kmc", KMC_VECTOR)
+            .card(ENC, &hex24(0x11)).card(MAC, &hex24(0x22));
+        let (r, asked) = conf.resolve_aid(&[]);
+        let c = r.unwrap();
+        assert_eq!(c.mode, SmMode::Transmit);
+        assert!(!c.aid_known);
+        let keys = c.keys.as_ref().unwrap();
+        assert_eq!(keys.sm, SM_VECTOR);
+        assert_eq!(keys.auth, AUTH_VECTOR);
+        assert_eq!(c.key_source, KeySource::CardKmc);
+        assert!(asked.iter().all(|k| !k.starts_with("keyset_")), "keyset entries looked up: {asked:?}");
+        /* with the AID the card keyset wins */
+        let c = conf.resolve().unwrap();
+        assert!(c.aid_known);
+        assert_eq!(c.key_source, KeySource::CardKeyset);
+    }
+
+    #[test]
+    fn missing_aid_is_not_an_error() {
+        /* nothing configured: mode none */
+        let c = Conf::new().resolve_aid(&[]).0.unwrap();
+        assert_eq!(c.mode, SmMode::None);
+        assert!(c.keys.is_none());
+        /* only AID-named keysets: no keys yet, but no error */
+        let c = Conf::new().block("mode", "acl").card(ENC, &hex24(0x11)).card(MAC, &hex24(0x22))
+            .resolve_aid(&[]).0.unwrap();
+        assert_eq!(c.mode, SmMode::Acl);
+        assert!(c.keys.is_none());
+        assert_eq!(c.key_source, KeySource::None);
+        assert!(!c.aid_known);
+        /* legacy keysets need the AID too */
+        let c = Conf::new().legacy(ENC, &hex24(0x33)).legacy(MAC, &hex24(0x44)).resolve_aid(&[]).0.unwrap();
+        assert_eq!(c.mode, SmMode::None);
+        assert!(c.keys.is_none());
     }
 
     #[test]

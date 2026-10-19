@@ -537,7 +537,7 @@ mod sm;
 use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy, SmCmd, SmUse};
 
 mod sm_config;
-use sm_config::evo_sm_config_free;
+use sm_config::{evo_sm_config_free, evo_sm_note_df_name};
 
 cfg_select! {
 not(target_os = "windows") => {
@@ -2517,6 +2517,10 @@ fn acos5_process_fci(card: &mut sc_card, ctx: &mut sc_context, file: &mut sc_fil
     }
 
     let fci = Fci::new_parsed(card, unsafe { from_raw_parts(buf_ref_ptr, buflen) });
+    /* ACOS5-EVO: the application DF's name is the AID that names the SM keyset entries */
+    if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 && file.type_ == SC_FILE_TYPE_DF {
+        evo_sm_note_df_name(card, file);
+    }
 
     // perform some corrective actions
     if  file.type_ == 0 && [FDB_ECC_KEY_EF, FDB_SE_FILE].contains(&fci.fdb) {

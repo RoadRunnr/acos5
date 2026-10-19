@@ -37,7 +37,6 @@ use std::ptr::{null, null_mut};
 use std::slice::from_raw_parts;
 use std::time::Instant;
 use std::cmp::min;
-use std::cell::Cell;
 use function_name::named;
 use opensc_sys::opensc::{sc_context, sc_card, sc_hex_to_bin, sc_transmit_apdu,
                          sc_check_sw, sc_pin_cmd_data, SC_PIN_STATE_LOGGED_IN, SC_PIN_STATE_LOGGED_OUT,
@@ -63,7 +62,7 @@ use crate::no_cdecl::{authenticate_external, authenticate_internal};
 use crate::wrappers::{wr_do_log, wr_do_log_t, wr_do_log_tttt, wr_do_log_tu,
                       wr_do_log_tuvw, wr_do_log_rv_ret, wr_do_log_sds_ret, wr_do_log_rv};
 use crate::tasn1_pkcs15_util::analyze_PKCS15_DIRRecord_2F00;
-use crate::sm_config::{evo_sm_config, wipe, SmMode};
+use crate::sm_config::{evo_sm_config, evo_sm_find_aid, wipe, EvoSmConfig, SmMode};
 
 #[expect(clippy::as_conversions, reason = "..")]
 #[expect(clippy::cast_possible_truncation, reason = "we know, what we are doing here !")]
@@ -394,7 +393,7 @@ fn sm_dur(cmd: u32) -> u128
 
 /// Set `card.sm_ctx.info.current_aid` from EF.DIR if it is not yet known; the current path stays selected.
 #[named]
-pub(crate) fn sm_ensure_current_aid(card: &mut sc_card) -> Result<(), i32>
+fn sm_ensure_current_aid(card: &mut sc_card) -> Result<(), i32>
 {
     if card.ctx.is_null() { return Err(-1) }
     #[cfg(not(target_os = "windows"))]
@@ -1235,23 +1234,12 @@ pub(crate) fn evo_sm_use(mode: SmMode, scb: u8, has_ct: bool, cmd: SmCmd) -> Res
     }
 }
 
-thread_local! {
-    /* set while evo_sm_config reads its inputs from the card (EF.DIR for the AID) */
-    static EVO_SM_CONFIG_LOADING: Cell<bool> = const { Cell::new(false) };
-}
-
-struct ConfigLoading;
-
-impl ConfigLoading {
-    fn enter() -> Self { EVO_SM_CONFIG_LOADING.with(|l| l.set(true)); Self }
-}
-
-impl Drop for ConfigLoading {
-    fn drop(&mut self) { EVO_SM_CONFIG_LOADING.with(|l| l.set(false)); }
-}
-
 /// `evo_sm_use` with the card's configured mode. When SM is required but not possible, logs one line naming
 /// the card serial and the missing setting.
+///
+/// Mode and kmc resolve without the AID. On the first decision that is not plain while the AID is unknown
+/// (the keyset entries are named after it), the AID is looked up (`evo_sm_find_aid`, SELECT only) and the
+/// settings are resolved again, so the keys are final before the first SM command.
 ///
 /// # Errors
 /// As `evo_sm_config` and `evo_sm_use`; `SC_ERROR_SM_KEYSET_NOT_FOUND` if SM is to be used but no keys resolve.
@@ -1259,14 +1247,12 @@ pub(crate) fn evo_sm_decide(card: &mut sc_card, scb: u8, has_ct: bool, cmd: SmCm
     if card.ctx.is_null() { return Err(SC_ERROR_SM); }
     let ctx = unsafe { &mut *card.ctx };
     let f = c"evo_sm_decide";
-    /* the configuration's own read of EF.DIR comes back here: it is read plain */
-    if EVO_SM_CONFIG_LOADING.with(Cell::get) {
-        return evo_sm_use(SmMode::None, scb, has_ct, cmd).map_err(|e| log3ifr_ret!(ctx,f,line!(), e));
+    let mut config = evo_sm_config(card)?;
+    /* SM, or an error that a legacy keyset (mode acl) found with the AID would change */
+    let needs_keys = |config: &EvoSmConfig| evo_sm_use(config.mode, scb, has_ct, cmd) != Ok(SmUse::Plain);
+    if !config.aid_known && needs_keys(&config) && evo_sm_find_aid(card) {
+        config = evo_sm_config(card)?;
     }
-    let config = {
-        let _loading = ConfigLoading::enter();
-        evo_sm_config(card)?
-    };
     let serial_c = CString::new(config.serial_hex()).unwrap_or_default();
     match evo_sm_use(config.mode, scb, has_ct, cmd) {
         Err(e) => {
