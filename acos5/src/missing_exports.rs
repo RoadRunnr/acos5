@@ -42,10 +42,12 @@ use std::slice;
 use function_name::named;
 use opensc_sys::opensc::{sc_card, sc_algorithm_info, SC_ALGORITHM_EC, sc_compare_oid, sc_context};
 
-use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_WRONG_PADDING, SC_ERROR_INTERNAL, SC_ERROR_OUT_OF_MEMORY};
+use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_WRONG_PADDING, SC_ERROR_INTERNAL, SC_ERROR_OUT_OF_MEMORY,
+                         SC_ERROR_BUFFER_TOO_SMALL};
 
 use opensc_sys::types::sc_object_id;
 use crate::constants_types::safe_int_try_from;
+use crate::sm_config::wipe;
 /*, sc_apdu, SC_APDU_CASE_1, SC_APDU_CASE_2_SHORT, SC_APDU_CASE_2_EXT,
                        SC_APDU_CASE_3_SHORT, SC_APDU_CASE_3_EXT, SC_APDU_CASE_4_SHORT, SC_APDU_CASE_4_EXT*/
 
@@ -433,9 +435,50 @@ pub(crate) fn me_pkcs1_strip_02_padding(vec: &mut Vec<u8>) -> i32 //-> Result<Ve
     safe_int_try_from::<usize,i32>(pos)
 }
 
+/// The message of a PKCS#1 v1.5 type 02 block, copied to `out`. For PSO DECIPHER under SM on the ACOS5-EVO, which
+/// leaves the padding in the result (tested with a real ACOS5-EVO card). On an error nothing is written to `out`.
+///
+/// # Errors
+/// As `me_pkcs1_strip_02_padding`; `SC_ERROR_BUFFER_TOO_SMALL` if the message does not fit `out`.
+pub(crate) fn evo_strip_02(block: &[u8], out: &mut [u8]) -> Result<usize, i32> {
+    let mut vec = block.to_vec();
+    let rv = me_pkcs1_strip_02_padding(&mut vec);
+    let result = if rv < 0 { Err(rv) }
+                 else if vec.len() > out.len() { Err(SC_ERROR_BUFFER_TOO_SMALL) }
+                 else { out[..vec.len()].copy_from_slice(&vec); Ok(vec.len()) };
+    wipe(&mut vec);
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{me_pkcs1_strip_01_padding, me_pkcs1_strip_02_padding, SC_ERROR_WRONG_PADDING, SC_ERROR_INTERNAL};
+    use super::{evo_strip_02, me_pkcs1_strip_01_padding, me_pkcs1_strip_02_padding, SC_ERROR_WRONG_PADDING,
+                SC_ERROR_INTERNAL, SC_ERROR_BUFFER_TOO_SMALL};
+
+    #[test]
+    fn strip_02_after_sm() {
+        use std::iter::repeat_n;
+        let msg: Vec<u8> = (1..=32).collect();
+        let mut block = vec![0x00_u8, 0x02];
+        block.extend(repeat_n(0x5A, 256 - 3 - 32));
+        block.push(0x00);
+        block.extend_from_slice(&msg);
+        let mut out = [0xEE_u8; 256];
+        assert_eq!(evo_strip_02(&block, &mut out), Ok(32));
+        assert_eq!(&out[..32], msg.as_slice());
+        /* a type 01 block or a block without the 00 separator is an error; nothing is written to out */
+        let mut bad = block.clone();
+        bad[1] = 0x01;
+        let mut out = [0xEE_u8; 256];
+        assert_eq!(evo_strip_02(&bad, &mut out), Err(SC_ERROR_WRONG_PADDING));
+        assert!(out.iter().all(|&b| b == 0xEE));
+        let mut bad = vec![0x00_u8, 0x02];
+        bad.extend(repeat_n(0x5A, 254));
+        assert_eq!(evo_strip_02(&bad, &mut out), Err(SC_ERROR_WRONG_PADDING));
+        assert!(out.iter().all(|&b| b == 0xEE));
+        /* an output buffer too small for the message */
+        assert_eq!(evo_strip_02(&block, &mut [0_u8; 31]), Err(SC_ERROR_BUFFER_TOO_SMALL));
+    }
 //    use opensc_sys::errors::{SC_SUCCESS};
 
     #[test]

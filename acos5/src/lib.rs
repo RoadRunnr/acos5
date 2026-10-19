@@ -510,7 +510,7 @@ use crypto::{ec_point_uncompress, ec_spki_der};
 /// In the meantime, I duplicated the code of valuable non-callable functions via this module.
 mod missing_exports;
 use missing_exports::{me_card_add_symmetric_alg, me_card_find_alg, //me_get_max_recv_size, me_get_max_send_size,
-                      me_pkcs1_strip_01_padding, me_pkcs1_strip_02_padding};//, me_get_encoding_flags
+                      me_pkcs1_strip_01_padding, me_pkcs1_strip_02_padding, evo_strip_02};//, me_get_encoding_flags
 
 mod no_cdecl;
 use no_cdecl::{select_file_by_path, enum_dir,
@@ -536,10 +536,11 @@ use se::{map_scb8_to_acl, se_get_is_scb_suitable_for_sm_has_ct, se_parse_sae, se
 
 mod sm;
 use sm::{sm_erase_binary, sm_delete_file, sm_pin_cmd, sm_pin_cmd_get_policy, evo_sm_pin_cmd, evo_sm_transmit, evo_sm_keys,
+         evo_sm_transmit_chained,
          SmCmd, SmUse};
 
 mod sm_config;
-use sm_config::{evo_sm_config_free, evo_sm_note_df_name};
+use sm_config::{evo_sm_config_free, evo_sm_note_df_name, wipe};
 
 cfg_select! {
 not(target_os = "windows") => {
@@ -3730,6 +3731,33 @@ fn acos5_decipher(card: &mut sc_card, ctx: &mut sc_context, crgram: &[u8], out: 
             if rv < 0 {
                 log3ifr!(ctx,f,line!(), c"User consent denied", rv);
                 return Err(rv);
+            }
+        }
+    }
+
+    /* ACOS5-EVO: under SM if the key EF's use condition asks for it, encrypted, one wrapped command per chained block
+       (tested with a real ACOS5-EVO card). The card leaves the PKCS#1 v1.5 padding in the result. No plain retry:
+       the card refuses plain use of such a key. */
+    if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+        let file_ref = get_sec_env(card).file_ref;
+        if file_ref.len >= 2 {
+            let fid = u16::from_be_bytes([file_ref.value[file_ref.len-2], file_ref.value[file_ref.len-1]]);
+            if evo_key_sm_use(card, fid, CRYPTO, SmCmd::Decipher).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))? != SmUse::Plain {
+                let for_signature = get_is_running_compute_signature(card);
+                set_is_running_compute_signature(card, false);
+                let raw_allowed = (SC_ALGORITHM_RSA_RAW & get_sec_env(card).algorithm_flags) != 0;
+                let mut buf = vec![0_u8; crgram.len()];
+                let result = evo_sm_transmit_chained(card, [0, 0x2A, 0x80, 0x84], crgram, &mut buf).and_then(|n| {
+                    let strip = if for_signature { Err(SC_ERROR_WRONG_PADDING) } else { evo_strip_02(&buf[..n], out) };
+                    match strip {
+                        Err(e) if !for_signature && !raw_allowed => Err(e),
+                        Err(_) => { out[..n].copy_from_slice(&buf[..n]); Ok(n) },
+                        Ok(len) => Ok(len),
+                    }
+                });
+                wipe(&mut buf);
+                let len = result.map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
+                return Ok(log3ifr_ret!(ctx,f,line!(), safe_int_try_from::<usize,i32>(len)));
             }
         }
     }
