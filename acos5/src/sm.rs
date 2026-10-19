@@ -37,6 +37,7 @@ use std::ptr::{null, null_mut};
 use std::slice::from_raw_parts;
 use std::time::Instant;
 use std::cmp::min;
+use std::ops::Range;
 use function_name::named;
 use opensc_sys::opensc::{sc_context, sc_card, sc_hex_to_bin, sc_transmit_apdu,
                          sc_check_sw, sc_pin_cmd_data, SC_PIN_STATE_LOGGED_IN, SC_PIN_STATE_LOGGED_OUT,
@@ -1334,6 +1335,49 @@ pub(crate) fn evo_sm_transmit(card: &mut sc_card, cmd: [u8; 4], data: &[u8], enc
     Ok(len)
 }
 
+/// Command data bytes per chained SM block: 223 bytes with ISO padding give `87 E1 01 <224 bytes>`, so the `87`
+/// length stays one byte and the SM data field with `8E 04 <MAC>` is 233 bytes.
+const EVO_SM_CHAIN_BLOCK: usize = 223;
+
+/// The chained SM blocks for `len` bytes of command data: the command header of each block (CLA with the chaining
+/// bit `10` on all but the last) and its range of the data. No blocks for no data.
+fn evo_sm_chain_blocks(cmd: [u8; 4], len: usize) -> Vec<([u8; 4], Range<usize>)> {
+    (0..len).step_by(EVO_SM_CHAIN_BLOCK).map(|start| {
+        let end = min(start + EVO_SM_CHAIN_BLOCK, len);
+        let cla = if end < len { cmd[0] | 0x10 } else { cmd[0] };
+        ([cla, cmd[1], cmd[2], cmd[3]], start..end)
+    }).collect()
+}
+
+/// Send command data under SM with command chaining, encrypted: one wrapped command with its own GET CHALLENGE per
+/// block of up to 223 bytes, the MAC header over the CLA sent (`1C` on all blocks but the last, `0C` on the last).
+/// Every block but the last must answer with the inner SW `90 00`. The inner SW of the last block may be `61 xx`
+/// when data came back, as for PSO SIGN under SM. Tested with a real ACOS5-EVO card (PSO DECIPHER, RSA-2048).
+/// Returns the number of plain response bytes written to `out`.
+///
+/// # Errors
+/// As `evo_sm_transmit_sw`; the mapped SW if a block is refused; `SC_ERROR_SM` for a status word without MAC.
+pub(crate) fn evo_sm_transmit_chained(card: &mut sc_card, cmd: [u8; 4], data: &[u8], out: &mut [u8])
+    -> Result<usize, i32>
+{
+    let blocks = evo_sm_chain_blocks(cmd, data.len());
+    let mut len = 0;
+    for (block_cmd, range) in blocks {
+        let last = range.end == data.len();
+        let (n, sw, authentic) = evo_sm_transmit_sw(card, block_cmd, &data[range], true, 0, out)?;
+        let ok = if last { sw == 0x9000 || (sw >> 8 == 0x61 && n > 0) } else { sw == 0x9000 };
+        if !(ok && authentic) {
+            let ctx = unsafe { &mut *card.ctx };
+            let [sw1, sw2] = sw.to_be_bytes();
+            let rv = unsafe { sc_check_sw(card, u32::from(sw1), u32::from(sw2)) };
+            let rv = if rv == SC_SUCCESS || !authentic && sw == 0x9000 { SC_ERROR_SM } else { rv };
+            return Err(log3ifr_ret!(ctx, c"evo_sm_transmit_chained", line!(), rv));
+        }
+        len = n;
+    }
+    Ok(len)
+}
+
 /// As `evo_sm_transmit`, but returns the status word with the response length instead of checking it: the
 /// inner SW from the 99 object, or the outer SW if the card answered without SM. The third value is true for
 /// an inner SW (covered by the response MAC) and false for an outer SW (not authenticated).
@@ -1600,7 +1644,8 @@ mod tests_evo_sm {
     use opensc_sys::errors::SC_ERROR_SECURITY_STATUS_NOT_SATISFIED;
     use crate::sm_config::SmMode;
     use opensc_sys::errors::{SC_ERROR_AUTH_METHOD_BLOCKED, SC_ERROR_PIN_CODE_INCORRECT, SC_ERROR_SM, SC_SUCCESS};
-    use super::{evo_incr, evo_pad, evo_unpad, evo_sm_use, evo_sm_wrap, evo_sm_unwrap, map_inner_sw, SmCmd, SmUse};
+    use super::{evo_incr, evo_pad, evo_unpad, evo_sm_chain_blocks, evo_sm_use, evo_sm_wrap, evo_sm_unwrap, map_inner_sw,
+                SmCmd, SmUse};
     use core::array::from_fn;
     use std::fmt::Write as _;
     use crate::crypto::{aes_cbc_nopad, aes_cmac, Encrypt};
@@ -1645,6 +1690,36 @@ mod tests_evo_sm {
                 assert_eq!(evo_sm_use(mode, scb, has_ct, cmd), want, "mode {mode:?}, SCB {scb:02X}, {cmd:?}");
             }
         }
+    }
+
+    #[test]
+    fn chain_blocks_split_and_cla() {
+        /* 256 bytes (RSA-2048): 223 + 33, CLA 10 on all blocks but the last */
+        assert_eq!(evo_sm_chain_blocks([0x00, 0x2A, 0x80, 0x84], 256),
+                   vec![([0x10, 0x2A, 0x80, 0x84], 0..223), ([0x00, 0x2A, 0x80, 0x84], 223..256)]);
+        /* 512 bytes (RSA-4096): three blocks */
+        let blocks = evo_sm_chain_blocks([0x00, 0x2A, 0x80, 0x84], 512);
+        assert_eq!(blocks.iter().map(|b| (b.0[0], b.1.len())).collect::<Vec<_>>(), [(0x10, 223), (0x10, 223), (0x00, 66)]);
+        /* up to one block: no chaining */
+        assert_eq!(evo_sm_chain_blocks([0x00, 0x2A, 0x80, 0x84], 223), vec![([0x00, 0x2A, 0x80, 0x84], 0..223)]);
+        assert!(evo_sm_chain_blocks([0x00, 0x2A, 0x80, 0x84], 0).is_empty());
+    }
+
+    #[test]
+    fn wrap_chained_block_mac_header() {
+        /* a chained block (CLA 10): the MAC header and the CLA sent are 1C; vector from tools/evo_sm.py
+           (EvoSM.wrap with cla_mac 1C), not sent to a card */
+        let key = test_key();
+        let mut iv = test_challenge();
+        evo_incr(&mut iv);
+        let got = evo_sm_wrap(&key, &iv, [0x10, 0x2A, 0x80, 0x84], &[0x5A; 223], true, 0);
+        assert_eq!(&got[..3], &[0x87, 0xE1, 0x01]);
+        let want = "87e101a9db1c9dd2282c424c699bc06239fcef6f9827f5e651db06ce3a678df0323a96f45e29fc8507f1f4e8a7ad8c2489b9\
+                    ba9b48d08affde0a456bfa0e38c3614274efa0b47f2811d1ed7c51630d646e755d6f9054e0eb849b6cd4f63979b2726bd678\
+                    f7b2a8525f1ddb29ff08e7b95881763b150c26c9272e387fca62c57317926a4ada8603603fafb6c47283ae2b62adf3af0a04\
+                    1e23ae0d77770d1e0cab90d0c07a467bca2d76dc85e969bfd42a96805e7ddac2ee5d0eac1e5ba7295a1c2097e1c7603ab594\
+                    782484273c43692929ef043960a6e73edbec139ea9b3a8bbae98368e040f351baf";
+        assert_eq!(hex(&got), want);
     }
 
     #[test]
