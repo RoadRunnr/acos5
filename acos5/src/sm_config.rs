@@ -15,9 +15,9 @@ The card_driver block names one SM block with `secure_messaging = <name>`:
         }
     }
 
-Each setting resolves from the card sub-block, then the block, then the default. Keys resolve from the
-card's keysets, then from the kmc in effect (card, then block). Without a named block, the old keyset
-entries in the card_driver block still apply, with mode acl.
+Each setting resolves from the card sub-block, then the block, then the default. Keys resolve in the order
+card keyset, card kmc, block keyset, block kmc. Without a named block, the old keyset entries in the
+card_driver block still apply, with mode acl. In mode none an invalid key setting is logged and ignored.
 */
 
 use std::ffi::{CStr, CString};
@@ -51,13 +51,14 @@ impl SmMode {
 
 /// Where the keys of an `EvoSmConfig` come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeySource { CardKeyset, CardKmc, BlockKmc, Legacy, None }
+pub(crate) enum KeySource { CardKeyset, CardKmc, BlockKeyset, BlockKmc, Legacy, None }
 
 impl KeySource {
     pub(crate) fn name(self) -> &'static CStr {
         match self {
             Self::CardKeyset => c"card keyset",
             Self::CardKmc    => c"card kmc",
+            Self::BlockKeyset => c"block keyset",
             Self::BlockKmc   => c"block kmc",
             Self::Legacy     => c"legacy",
             Self::None       => c"none",
@@ -106,6 +107,8 @@ pub(crate) struct EvoSmConfig {
     pub(crate) session_keys: bool,
     pub(crate) key_source: KeySource,
     pub(crate) serial: [u8; 8],
+    /// In mode `none`: the invalid key setting that was ignored (its entry name, never the value).
+    pub(crate) ignored_setting: Option<String>,
 }
 
 impl EvoSmConfig {
@@ -165,25 +168,26 @@ fn parse_key(value: String, allow_raw: bool) -> Result<[u8; KEY_LEN], i32> {
     result
 }
 
+/* An invalid key setting: the error code and the name of the entry (never its value). */
+type KeyError = (i32, String);
+
 /* the keyset pair enc (key 82) and mac (key 81); none: Ok(None), only one of them: error */
-fn keyset(get: &dyn Fn(&str) -> Option<String>, aid: &[u8], allow_raw: bool) -> Result<Option<EvoSmKeys>, i32> {
+fn keyset(get: &dyn Fn(&str) -> Option<String>, aid: &[u8], allow_raw: bool) -> Result<Option<EvoSmKeys>, KeyError> {
     let aid_hex = serial_hex(aid);
-    let enc = get(&format!("keyset_{aid_hex}_02_enc"));
-    let mac = get(&format!("keyset_{aid_hex}_02_mac"));
-    match (enc, mac) {
+    let enc_name = format!("keyset_{aid_hex}_02_enc");
+    let mac_name = format!("keyset_{aid_hex}_02_mac");
+    match (get(&enc_name), get(&mac_name)) {
         (None, None) => Ok(None),
         (Some(enc), Some(mac)) => {
             match (parse_key(enc, allow_raw), parse_key(mac, allow_raw)) {
                 (Ok(sm), Ok(auth)) => Ok(Some(EvoSmKeys { sm, auth })),
-                (Ok(mut key), Err(e)) | (Err(e), Ok(mut key)) => { wipe(&mut key); Err(e) },
-                (Err(e), Err(_)) => Err(e),
+                (Ok(mut key), Err(e)) => { wipe(&mut key); Err((e, mac_name)) },
+                (Err(e), Ok(mut key)) => { wipe(&mut key); Err((e, enc_name)) },
+                (Err(e), Err(_)) => Err((e, enc_name)),
             }
         },
-        (enc, mac) => {
-            if let Some(s) = enc { wipe_string(s); }
-            if let Some(s) = mac { wipe_string(s); }
-            Err(SC_ERROR_INVALID_DATA)
-        },
+        (Some(enc), None) => { wipe_string(enc); Err((SC_ERROR_INVALID_DATA, mac_name)) },
+        (None, Some(mac)) => { wipe_string(mac); Err((SC_ERROR_INVALID_DATA, enc_name)) },
     }
 }
 
@@ -211,13 +215,14 @@ fn keys_from_kmc(value: String, serial: &[u8; 8]) -> Result<EvoSmKeys, i32> {
 /// Resolve the SM settings of one card.
 ///
 /// `lookup(Some(serial_hex), key)` reads from the card's sub-block, `lookup(None, key)` from the block level.
-/// `legacy(key)` reads the old keyset entries of the `card_driver` block; they apply only when the keys do
-/// not resolve otherwise, and then the mode defaults to `acl`.
+/// Keys resolve from the card keyset, card `kmc`, block keyset, block `kmc`, then `legacy(key)`, which reads
+/// the old keyset entries of the `card_driver` block; with legacy keys the mode defaults to `acl`.
 ///
 /// # Errors
 /// `SC_ERROR_INVALID_ARGUMENTS` for an unknown `mode` or `session_keys` value, `SC_ERROR_INVALID_DATA`
 /// for a keyset or `kmc` that is not hex of the right length, or a keyset without its partner.
-/// No keys is not an error: `keys` is `None` then.
+/// No keys is not an error: `keys` is `None` then. In mode `none` an invalid key setting is not an error
+/// either: `keys` is `None` and `ignored_setting` names the entry.
 pub(crate) fn resolve(lookup: &dyn Fn(Option<&str>, &str) -> Option<String>, serial: &[u8; 8], aid: &[u8],
                       legacy: &dyn Fn(&str) -> Option<String>) -> Result<EvoSmConfig, i32>
 {
@@ -228,15 +233,41 @@ pub(crate) fn resolve(lookup: &dyn Fn(Option<&str>, &str) -> Option<String>, ser
     let mode = setting("mode").map(|v| parse_mode(&v)).transpose()?;
     let session_keys = setting("session_keys").map(|v| parse_bool(&v)).transpose()?.unwrap_or(false);
 
-    let (keys, key_source) =
-        if let Some(keys) = keyset(&card, aid, false)? { (Some(keys), KeySource::CardKeyset) }
-        else if let Some(kmc) = card("kmc") { (Some(keys_from_kmc(kmc, serial)?), KeySource::CardKmc) }
-        else if let Some(kmc) = lookup(None, "kmc") { (Some(keys_from_kmc(kmc, serial)?), KeySource::BlockKmc) }
-        else if let Some(keys) = keyset(legacy, aid, true)? { (Some(keys), KeySource::Legacy) }
-        else { (None, KeySource::None) };
+    let block = |key: &str| lookup(None, key);
+    let kmc = |value: String, entry: String| keys_from_kmc(value, serial).map_err(|e| (e, entry));
+    let card_entry = |entry: String| format!("{entry} in card {serial_hex}");
+    let block_entry = |entry: String| format!("{entry} in the block");
+    /* card level before block level; within a level the keyset before kmc */
+    let found = (|| -> Result<(Option<EvoSmKeys>, KeySource), (KeyError, KeySource)> {
+        if let Some(keys) = keyset(&card, aid, false).map_err(|(e, n)| ((e, card_entry(n)), KeySource::CardKeyset))? {
+            return Ok((Some(keys), KeySource::CardKeyset));
+        }
+        if let Some(v) = card("kmc") {
+            return kmc(v, card_entry("kmc".into())).map(|k| (Some(k), KeySource::CardKmc)).map_err(|e| (e, KeySource::CardKmc));
+        }
+        if let Some(keys) = keyset(&block, aid, false).map_err(|(e, n)| ((e, block_entry(n)), KeySource::BlockKeyset))? {
+            return Ok((Some(keys), KeySource::BlockKeyset));
+        }
+        if let Some(v) = block("kmc") {
+            return kmc(v, block_entry("kmc".into())).map(|k| (Some(k), KeySource::BlockKmc)).map_err(|e| (e, KeySource::BlockKmc));
+        }
+        if let Some(keys) = keyset(legacy, aid, true).map_err(|(e, n)| ((e, format!("{n} in card_driver")), KeySource::Legacy))? {
+            return Ok((Some(keys), KeySource::Legacy));
+        }
+        Ok((None, KeySource::None))
+    })();
 
-    let mode = mode.unwrap_or(if key_source == KeySource::Legacy { SmMode::Acl } else { SmMode::None });
-    Ok(EvoSmConfig { mode, keys, session_keys, key_source, serial: *serial })
+    /* the old configuration always used SM where the access conditions required it */
+    let mode_for = |source: KeySource| mode.unwrap_or(if source == KeySource::Legacy { SmMode::Acl } else { SmMode::None });
+    match found {
+        Ok((keys, key_source)) =>
+            Ok(EvoSmConfig { mode: mode_for(key_source), keys, session_keys, key_source, serial: *serial, ignored_setting: None }),
+        /* mode none never uses keys, so an invalid key setting is only reported */
+        Err(((_, entry), source)) if mode_for(source) == SmMode::None =>
+            Ok(EvoSmConfig { mode: SmMode::None, keys: None, session_keys, key_source: KeySource::None, serial: *serial,
+                             ignored_setting: Some(entry) }),
+        Err(((e, _), _)) => Err(e),
+    }
 }
 
 /* first block named `name` of type `item` within the application blocks of opensc.conf */
@@ -320,6 +351,10 @@ pub(crate) fn evo_sm_config(card: &mut sc_card) -> Result<EvoSmConfig, i32> {
     let serial_c = CString::new(config.serial_hex()).unwrap_or_default();
     log3if!(ctx,f,line!(), c"secure_messaging: card %s, mode %s, keys from %s", serial_c.as_ptr(),
         config.mode.name().as_ptr(), config.key_source.name().as_ptr());
+    if let Some(ref entry) = config.ignored_setting {
+        let entry_c = CString::new(entry.as_str()).unwrap_or_default();
+        log3if!(ctx,f,line!(), c"secure_messaging: mode none, ignoring the invalid setting %s", entry_c.as_ptr());
+    }
     if config.key_source == KeySource::Legacy {
         log3if!(ctx,f,line!(), c"secure_messaging: deprecated keyset entries in card_driver; move them into a secure_messaging block");
     }
@@ -425,14 +460,41 @@ mod tests {
     }
 
     #[test]
+    fn block_keyset_used_when_card_has_none() {
+        let c = Conf::new().block(ENC, &hex24(0x44)).block(MAC, &hex24(0x55)).resolve().unwrap();
+        let keys = c.keys.as_ref().unwrap();
+        assert_eq!(keys.sm, [0x44; 24]);
+        assert_eq!(keys.auth, [0x55; 24]);
+        assert_eq!(c.key_source, KeySource::BlockKeyset);
+    }
+
+    #[test]
+    fn card_kmc_beats_block_keyset() {
+        let c = Conf::new().block(ENC, &hex24(0x44)).block(MAC, &hex24(0x55)).card("kmc", KMC_VECTOR).resolve().unwrap();
+        let keys = c.keys.as_ref().unwrap();
+        assert_eq!(keys.sm, SM_VECTOR);
+        assert_eq!(keys.auth, AUTH_VECTOR);
+        assert_eq!(c.key_source, KeySource::CardKmc);
+    }
+
+    #[test]
+    fn mode_none_ignores_bad_kmc() {
+        let c = Conf::new().block("mode", "none").block("kmc", &"11".repeat(16)).resolve().unwrap();
+        assert_eq!(c.mode, SmMode::None);
+        assert!(c.keys.is_none());
+        assert_eq!(c.key_source, KeySource::None);
+        assert_eq!(c.ignored_setting.as_deref(), Some("kmc in the block"));
+    }
+
+    #[test]
     fn resolve_rejects_short_keyset() {
-        let r = Conf::new().card(ENC, &"11".repeat(23)).card(MAC, &hex24(0x22)).resolve();
+        let r = Conf::new().block("mode", "acl").card(ENC, &"11".repeat(23)).card(MAC, &hex24(0x22)).resolve();
         assert_eq!(r.err(), Some(SC_ERROR_INVALID_DATA));
     }
 
     #[test]
     fn resolve_rejects_short_kmc() {
-        let r = Conf::new().block("kmc", &"11".repeat(16)).resolve();
+        let r = Conf::new().block("mode", "acl").block("kmc", &"11".repeat(16)).resolve();
         assert_eq!(r.err(), Some(SC_ERROR_INVALID_DATA));
     }
 
