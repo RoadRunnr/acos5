@@ -159,6 +159,14 @@ pub(crate) fn map_scb8_to_acl(card: &mut sc_card, file: &mut sc_file, scb8: [u8;
  *                     in associated Sec. Env. file, or it's an encoding of either `SC_AC_NONE` or `SC_AC_NEVER`
  * @param  op    IN    the operation that @param scb refers to, e.g. `SC_AC_OP_READ`
  */
+/// Whether an SCB other than `00` / `FF` names an SE record that `se_file_add_acl_entry` can resolve: record 1 to 14,
+/// bits 5 and 4 clear. Bits 7 and 6 together (`Cn`: every condition of the record, SM included) only on the
+/// ACOS5-EVO, tested with a real ACOS5-EVO card.
+fn scb_allowed(scb: u8, evo: bool) -> bool {
+    let record = scb & 0x0F;
+    !(record == 0 || record == 0x0F || scb & 0x30 != 0 || (scb & 0xC0 == 0xC0 && !evo))
+}
+
 //#[allow(clippy::needless_return)]
 fn se_file_add_acl_entry(card: &mut sc_card, file: &mut sc_file, scb: u8, op: u32)
 {
@@ -177,7 +185,7 @@ fn se_file_add_acl_entry(card: &mut sc_card, file: &mut sc_file, scb: u8, op: u3
         rv = unsafe { sc_file_add_acl_entry(file, op, SC_AC_NEVER, SC_AC_KEY_REF_NONE) };
         assert_eq!(SC_SUCCESS, rv);
     }
-    else if [0, 15].contains(&(scb & 0x0F)) || (scb & 0x30) != 0 || (scb & 0xC0) == 0xC0 // these bit combinations are not allowed
+    else if !scb_allowed(scb, card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4)
     {
         rv = unsafe { sc_file_add_acl_entry(file, op, SC_AC_UNKNOWN, SC_AC_KEY_REF_NONE) };
         assert_eq!(SC_SUCCESS, rv);
@@ -197,6 +205,7 @@ SCB: 41; [80 01 01  A4 09 83 01 81 83 01 01 95 01 08  B4 08 84 00 95 01 30 80 01
 SCB: 41; [80 01 01  A4 09 83 01 01 83 01 81 95 01 08  B4 08 84 00 95 01 30 80 01 02] => CHV1   PROT (CHV129 as OR alternative get's dropped)
 
 SCB: 81; [80 01 01  A4 09 83 01 81 83 01 01 95 01 08]                                => CHV129 CHV1 (AND: both conditions must be fulfilled)
+SCB: C1; [80 01 01  A4 09 83 01 81 83 01 01 95 01 08  B4 08 84 00 95 01 30 80 01 02] => CHV129 PROT (ACOS5-EVO: PIN and SM must both be satisfied)
 */
             if (scb & 0x40) != 0 && !res_se_sm.0 { // invalid, missing info for SM
                 rv = unsafe { sc_file_add_acl_entry(file, op, SC_AC_UNKNOWN, SC_AC_KEY_REF_NONE) };
@@ -661,6 +670,16 @@ pub(crate) fn se_parse_sae(vec_sac_info_opt: &mut Option<Vec<SACinfo>>, value_by
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scb_allowed_bit7() {
+        assert!(scb_allowed(0x42, false) && scb_allowed(0x42, true));
+        assert!(scb_allowed(0x81, false) && scb_allowed(0x81, true));
+        assert!(!scb_allowed(0xC2, false));
+        assert!(scb_allowed(0xC2, true));
+        assert!(!scb_allowed(0xC0, true) && !scb_allowed(0xCF, true));   // record 0 and 15 stay invalid
+        assert!(!scb_allowed(0x52, true) && !scb_allowed(0x62, true));   // bits 5 and 4 stay invalid
+    }
 
     #[test]
     fn test_se_parse_sac() {
