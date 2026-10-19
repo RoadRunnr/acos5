@@ -1217,20 +1217,23 @@ pub(crate) enum SmCmd { ReadFile, UpdateFile, Verify, ChangePin, Unblock, PutKey
 /// SCB `4n` requires SM per SE record n; SCB `FF` (never) does not count as SM.
 /// * `none`: never SM; an SCB that requires SM is an error.
 /// * `acl`: SM only where the SCB requires it, encrypted if the SE record has a CT.
-/// * `transmit`: SM for every command; PIN, key import and decipher data are always encrypted.
+/// * `transmit` (strict): as `acl`, but a PIN or key command (VERIFY, CHANGE REFERENCE DATA, RESET RETRY
+///   COUNTER, PUT KEY) whose SCB does not require SM is refused, so PINs and key material never go in plain.
+///   The card accepts SM only where the access condition requires it, so no command is forced into SM.
 ///
 /// # Errors
-/// `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` for mode `none` with an SCB that requires SM.
+/// `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` for mode `none` with an SCB that requires SM, and for mode
+/// `transmit` with a PIN or key command whose SCB does not require SM.
 pub(crate) fn evo_sm_use(mode: SmMode, scb: u8, has_ct: bool, cmd: SmCmd) -> Result<SmUse, i32> {
     let required = scb != 0xFF && (scb & 0x40) == 0x40;
     let by_se = if has_ct { SmUse::MacEnc } else { SmUse::Mac };
+    let secret = matches!(cmd, SmCmd::Verify | SmCmd::ChangePin | SmCmd::Unblock | SmCmd::PutKey);
     match mode {
         SmMode::None => if required { Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED) } else { Ok(SmUse::Plain) },
         SmMode::Acl => Ok(if required { by_se } else { SmUse::Plain }),
-        SmMode::Transmit => Ok(match cmd {
-            SmCmd::Verify | SmCmd::ChangePin | SmCmd::Unblock | SmCmd::PutKey | SmCmd::Decipher => SmUse::MacEnc,
-            SmCmd::ReadFile | SmCmd::UpdateFile | SmCmd::GenerateKey | SmCmd::Sign | SmCmd::GetKey => by_se,
-        }),
+        SmMode::Transmit => if required { Ok(by_se) }
+                            else if secret { Err(SC_ERROR_SECURITY_STATUS_NOT_SATISFIED) }
+                            else { Ok(SmUse::Plain) },
     }
 }
 
@@ -1248,13 +1251,22 @@ pub(crate) fn evo_sm_decide(card: &mut sc_card, scb: u8, has_ct: bool, cmd: SmCm
     let ctx = unsafe { &mut *card.ctx };
     let f = c"evo_sm_decide";
     let mut config = evo_sm_config(card)?;
-    /* SM, or an error that a legacy keyset (mode acl) found with the AID would change */
-    let needs_keys = |config: &EvoSmConfig| evo_sm_use(config.mode, scb, has_ct, cmd) != Ok(SmUse::Plain);
-    if !config.aid_known && needs_keys(&config) && evo_sm_find_aid(card) {
+    /* SM, or mode none refusing an SM access condition (a legacy keyset found with the AID gives mode acl) */
+    let needs_keys = |config: &EvoSmConfig| match evo_sm_use(config.mode, scb, has_ct, cmd) {
+        Ok(SmUse::Plain) => false,
+        Ok(_) => true,
+        Err(_) => config.mode == SmMode::None,
+    };
+    if !config.aid_known && needs_keys(&config) && evo_sm_find_aid(card).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))? {
         config = evo_sm_config(card)?;
     }
     let serial_c = CString::new(config.serial_hex()).unwrap_or_default();
     match evo_sm_use(config.mode, scb, has_ct, cmd) {
+        Err(e) if config.mode == SmMode::Transmit => {
+            log3if!(ctx,f,line!(), c"secure_messaging: card %s: mode transmit refused a plain PIN or key command",
+                serial_c.as_ptr());
+            Err(e)
+        },
         Err(e) => {
             log3if!(ctx,f,line!(), c"secure_messaging: card %s: the access condition requires SM, but mode is none; set mode",
                 serial_c.as_ptr());
@@ -1435,9 +1447,9 @@ mod tests_evo_sm {
             (SmMode::Acl,      0x01, false, [Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P), Ok(P)]),
             (SmMode::Acl,      0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M)]),
             (SmMode::Acl,      0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
-            (SmMode::Transmit, 0x00, false, [Ok(M), Ok(M), Ok(E), Ok(E), Ok(E), Ok(E), Ok(M), Ok(M), Ok(E), Ok(M)]),
-            (SmMode::Transmit, 0x01, false, [Ok(M), Ok(M), Ok(E), Ok(E), Ok(E), Ok(E), Ok(M), Ok(M), Ok(E), Ok(M)]),
-            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), Ok(E), Ok(E), Ok(E), Ok(E), Ok(M), Ok(M), Ok(E), Ok(M)]),
+            (SmMode::Transmit, 0x00, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::Transmit, 0x01, false, [Ok(P), Ok(P), ERR,   ERR,   ERR,   ERR,   Ok(P), Ok(P), Ok(P), Ok(P)]),
+            (SmMode::Transmit, 0x45, false, [Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M), Ok(M)]),
             (SmMode::Transmit, 0x46, true,  [Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E), Ok(E)]),
         ];
         for (mode, scb, has_ct, expected) in rows {
@@ -1447,6 +1459,7 @@ mod tests_evo_sm {
         }
         /* SCB FF is NEVER, not SM with SE record 0F: no SM decision error for it */
         assert_eq!(evo_sm_use(SmMode::None, 0xFF, false, SmCmd::ReadFile), Ok(P));
+        assert_eq!(evo_sm_use(SmMode::Transmit, 0xFF, false, SmCmd::Verify), ERR);
     }
 
     #[test]

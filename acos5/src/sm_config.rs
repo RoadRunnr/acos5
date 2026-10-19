@@ -30,7 +30,7 @@ use std::ptr::{null, null_mut};
 
 use libc::free;
 use opensc_sys::opensc::{sc_card, sc_context, sc_select_file, sc_get_mf_path};
-use opensc_sys::types::{sc_aid, sc_file, sc_path};
+use opensc_sys::types::{sc_aid, sc_file, sc_path, SC_MAX_PATH_SIZE};
 use opensc_sys::errors::{SC_SUCCESS, SC_ERROR_INTERNAL, SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_INVALID_DATA,
                          SC_ERROR_NOT_SUPPORTED};
 use opensc_sys::scconf::{scconf_block, scconf_find_blocks, scconf_get_str};
@@ -390,28 +390,44 @@ pub(crate) fn evo_sm_note_df_name(card: &mut sc_card, file: &sc_file) {
     }
 }
 
-/// Find the AID without reading any file: SELECT the DFs below the MF until one returns a DF name, then
-/// SELECT the previous path again. Returns whether the AID is known.
-pub(crate) fn evo_sm_find_aid(card: &mut sc_card) -> bool {
-    if card.sm_ctx.info.current_aid.len > 0 { return true; }
-    if card.ctx.is_null() || card.drv_data.is_null() { return false; }
+/* The path of a DF entry of `DataPrivate::files` (fid, path, file info), if it is an EVO DF below the MF whose
+   path enum_dir has filled in (`info[1]` is the path length then; list_files leaves the path zero). */
+fn df_path<'a>(fid: u16, path: &'a [u8; SC_MAX_PATH_SIZE], info: &[u8; 8]) -> Option<&'a [u8]> {
+    let len = usize::from(info[1]);
+    let filled = info[0] == FDB_DF && (4..=SC_MAX_PATH_SIZE).contains(&len) && len.is_multiple_of(2)
+        && path[..2] == [0x3F, 0] && path[len-2..len] == fid.to_be_bytes();
+    if filled { Some(&path[..len]) } else { None }
+}
+
+/// Find the AID without reading any file: SELECT the known DFs until one returns a DF name, then SELECT the
+/// previous path again. Does nothing while the driver initializes or if the current path is unknown.
+/// Returns whether the AID is known.
+///
+/// # Errors
+/// The error of the SELECT that restores the previous path; the pending command must not run then.
+pub(crate) fn evo_sm_find_aid(card: &mut sc_card) -> Result<bool, i32> {
+    if card.sm_ctx.info.current_aid.len > 0 { return Ok(true); }
+    if card.ctx.is_null() || card.drv_data.is_null() { return Err(SC_ERROR_INVALID_ARGUMENTS); }
     let ctx = unsafe { &mut *card.ctx };
     let f = c"evo_sm_find_aid";
-    let (curr_path, mut dfs) = {
+    let (curr_path, dfs) = {
         let dp = unsafe { &*card.drv_data.cast::<DataPrivate>() };
+        if dp.is_running_init { return Ok(false); }
         let curr_path : sc_path = cfg_select! {
             any(v0_20_0, v0_21_0, v0_22_0, v0_23_0, v0_24_0, v0_25_0, v0_25_1, v0_26_0, v0_26_1) =>
                  { card.cache.current_path }
             _ => { dp.card_cache.current_path }
         };
-        let dfs: Vec<u16> = dp.files.iter().filter(|(_, v)| v.1[0] == FDB_DF).map(|(id, _)| *id).collect();
+        let mut dfs: Vec<Vec<u8>> = dp.files.iter().filter_map(|(fid, v)| df_path(*fid, &v.0, &v.1).map(<[u8]>::to_vec))
+            .collect();
+        dfs.sort_unstable();
         (curr_path, dfs)
     };
-    dfs.sort_unstable();
-    for fid in dfs {
+    if curr_path.len == 0 || dfs.is_empty() { return Ok(false); }
+    for value in dfs {
         let mut path = unsafe { *sc_get_mf_path() };
-        path.value[path.len..path.len+2].copy_from_slice(&fid.to_be_bytes());
-        path.len += 2;
+        path.value[..value.len()].copy_from_slice(&value);
+        path.len = value.len();
         let mut file = null_mut();
         let guard_file = GuardFile::new(&raw mut file);
         if unsafe { sc_select_file(card, &raw const path, *guard_file) } == SC_SUCCESS && !file.is_null() {
@@ -419,10 +435,13 @@ pub(crate) fn evo_sm_find_aid(card: &mut sc_card) -> bool {
         }
         if card.sm_ctx.info.current_aid.len > 0 { break; }
     }
-    if curr_path.len > 0 && unsafe { sc_select_file(card, &raw const curr_path, null_mut()) } != SC_SUCCESS {
+    let rv = unsafe { sc_select_file(card, &raw const curr_path, null_mut()) };
+    if rv != SC_SUCCESS {
         log3if!(ctx,f,line!(), c"could not select the previous path again");
+        /* OpenSC error codes start at -1100; the driver uses -1 for internal failures */
+        return Err(log3ifr_ret!(ctx,f,line!(), if rv <= -1100 { rv } else { SC_ERROR_INTERNAL }));
     }
-    card.sm_ctx.info.current_aid.len > 0
+    Ok(card.sm_ctx.info.current_aid.len > 0)
 }
 
 #[cfg(test)]
@@ -430,7 +449,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use opensc_sys::errors::{SC_ERROR_INVALID_ARGUMENTS, SC_ERROR_INVALID_DATA};
-    use super::{resolve, EvoSmConfig, KeySource, SmMode};
+    use super::{df_path, resolve, EvoSmConfig, KeySource, SmMode};
 
     const SERIAL: [u8; 8] = [0x60, 0x20, 0x60, 0xA1, 0xC4, 0x65, 0x0A, 0x00];
     const SERIAL_HEX: &str = "602060A1C4650A00";
@@ -611,6 +630,21 @@ mod tests {
         let c = Conf::new().legacy(ENC, &hex24(0x33)).legacy(MAC, &hex24(0x44)).resolve_aid(&[]).0.unwrap();
         assert_eq!(c.mode, SmMode::None);
         assert!(c.keys.is_none());
+    }
+
+    #[test]
+    fn df_path_only_for_filled_paths() {
+        let mut path = [0_u8; 16];
+        path[..4].copy_from_slice(&[0x3F, 0, 0x41, 0]);
+        /* after enum_dir: FDB 38, path length 4 */
+        assert_eq!(df_path(0x4100, &path, &[0x38, 4, 0x41, 0, 0, 0, 0, 0]), Some(&[0x3F_u8, 0, 0x41, 0][..]));
+        /* from list_files only: path zero, DCB in byte 1 */
+        assert_eq!(df_path(0x4100, &[0; 16], &[0x38, 0, 0x41, 0, 0, 0, 0, 0]), None);
+        assert_eq!(df_path(0x4100, &[0; 16], &[0x38, 4, 0x41, 0, 0, 0, 0, 0]), None);
+        /* not a DF, the MF, or a path that does not end in the fid */
+        assert_eq!(df_path(0x4100, &path, &[0x01, 4, 0x41, 0, 0, 0, 0, 0]), None);
+        assert_eq!(df_path(0x3F00, &path, &[0x3F, 2, 0x3F, 0, 0, 0, 0, 0]), None);
+        assert_eq!(df_path(0x4200, &path, &[0x38, 4, 0x42, 0, 0, 0, 0, 0]), None);
     }
 
     #[test]
