@@ -1240,7 +1240,7 @@ fn acos5_put_key(card: &mut sc_card, offset: usize, data: &[u8]) -> i32 {
 /* Import an RSA or EC private key with PUT KEY. The key EF pair was created, activated and
    UPDATE-authenticated by acos5_pkcs15_create_key, which also left the file ids, curve/length and
    key-type code in DataPrivate.agc. The public EF is written first so the private record's on-card
-   pairwise test passes. See docs/acos5-evo-commands.md section 7 (PUT KEY). */
+   pairwise test passes. See docs/reference/acos5-evo-commands.md (PUT KEY). */
 #[named]
 fn acos5_pkcs15_store_key_asym(profile_ptr: *mut sc_profile, p15card_ptr: *mut sc_pkcs15_card,
                                object_ptr: *mut sc_pkcs15_object, key_ptr: *mut sc_pkcs15_prkey) -> i32 {

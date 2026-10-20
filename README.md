@@ -75,7 +75,7 @@ The documentation is in the `docs` directory:
 | Installation | [Installation](docs/installation.md) |
 | Guides | [Initialize a card](docs/guides/initialize-a-card.md), [Manage PINs](docs/guides/manage-pins.md), [Manage keys and certificates](docs/guides/manage-keys-and-certificates.md), [Set up secure messaging](docs/guides/set-up-secure-messaging.md), [Use the card with applications](docs/guides/use-with-applications.md) |
 | Troubleshooting | [Troubleshooting](docs/troubleshooting.md) |
-| Technical reference | [Configuration reference](docs/reference/configuration.md), [Supported cards](docs/reference/supported-cards.md), [Card content rules](docs/reference/card-content-rules.md), [Build options](docs/reference/build-options.md) |
+| Technical reference | [Configuration reference](docs/reference/configuration.md), [Supported cards](docs/reference/supported-cards.md), [Card content rules](docs/reference/card-content-rules.md), [Build options](docs/reference/build-options.md), [ACOS5-EVO command reference](docs/reference/acos5-evo-commands.md) (for driver developers) |
 
 ## Repository content
 
