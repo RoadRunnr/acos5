@@ -1624,10 +1624,12 @@ pub(crate) fn generate_asym(card: &mut sc_card, data: &mut CardCtlGenerateAsymCr
         }
     }
 
-    /* ACOS5-EVO: under SM if the private key EF's use condition asks for it; the data go in 81 (MAC only), the
-       form tested with a real ACOS5-EVO card (RSA; the card refuses SM for EC key generation) */
+    /* ACOS5-EVO: under SM if the private key EF's use condition or the DF SAE (evo_init --bind-sign binds
+       INS 46) asks for it; the data go in 81 (MAC only), the form tested with a real ACOS5-EVO card. With the
+       SAE on the EC key EF (not the DF) the card refused SM for EC generation; with the SAE on the DF it is
+       required and accepted. */
     let sm_use = if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
-        match evo_key_sm_use(card, data.file_id_priv, CRYPTO, SmCmd::GenerateKey) {
+        match evo_crypto_sm_use(card, Some(data.file_id_priv), SmCmd::GenerateKey, [0, 0x46, 0, 0]) {
             Ok(sm_use) => sm_use,
             Err(e) => return log3ifr_ret!(ctx,f,line!(), e),
         }
@@ -1652,8 +1654,14 @@ pub(crate) fn generate_asym(card: &mut sc_card, data: &mut CardCtlGenerateAsymCr
     }
     else {
         let command = [0_u8, 0x46, 0,0,1, data.key_curve_code];
+        if sm_use != SmUse::Plain {
+            rv = match evo_sm_transmit(card, [0, 0x46, 0, 0], &command[5..6], false, 0, &mut []) {
+                Ok(_) => SC_SUCCESS,
+                Err(e) => e,
+            };
+            return log3ifr_ret!(ctx,f,line!(), rv);
+        }
         let mut apdu = build_apdu(ctx, &command[.. command.len()], SC_APDU_CASE_3_SHORT, &mut[]);
-//log3if!(ctx,f,line!(), c"%s", unsafe {sc_dump_hex(command.as_ptr(), 7)});
         rv = unsafe { sc_transmit_apdu(card, &raw mut apdu) };  if rv != SC_SUCCESS { return log3ifr_ret!(ctx,f,line!(), rv); }
         rv = unsafe { sc_check_apdu(card, &raw const apdu) };
     }

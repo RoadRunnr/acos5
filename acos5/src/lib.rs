@@ -3902,8 +3902,8 @@ fn acos5_compute_signature(card: &mut sc_card, ctx: &mut sc_context, data: &[u8]
            the raw hash goes in 81 (MAC only), the card returns r || s in the SM response */
         if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
             let file_ref = get_sec_env(card).file_ref;
-            let fid = if file_ref.len >= 2 {
-                Some(u16::from_be_bytes([file_ref.value[file_ref.len-2], file_ref.value[file_ref.len-1]])) } else { None };
+            let fid = (file_ref.len >= 2)
+                .then(|| u16::from_be_bytes([file_ref.value[file_ref.len-2], file_ref.value[file_ref.len-1]]));
             if evo_crypto_sm_use(card, fid, SmCmd::Sign, [0, 0x2A, 0x9E, 0x9A]).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))? != SmUse::Plain {
                 let n = evo_sm_transmit(card, [0, 0x2A, 0x9E, 0x9A], data, false, 0, out)
                     .map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
@@ -4048,8 +4048,8 @@ digest_info.len(), digest_info[..15]==digest_algorithm_sha1[..], digest_info[..1
            tested with a real ACOS5-EVO card; the signature comes back encrypted when the SE record has a CT */
         if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
             let file_ref = get_sec_env(card).file_ref;
-            let fid = if file_ref.len >= 2 {
-                Some(u16::from_be_bytes([file_ref.value[file_ref.len-2], file_ref.value[file_ref.len-1]])) } else { None };
+            let fid = (file_ref.len >= 2)
+                .then(|| u16::from_be_bytes([file_ref.value[file_ref.len-2], file_ref.value[file_ref.len-1]]));
             if evo_crypto_sm_use(card, fid, SmCmd::Sign, [0, 0x2A, 0x9E, 0x9A]).map_err(|e| log3ifr_ret!(ctx,f,line!(), e))? != SmUse::Plain {
                 let n = evo_sm_transmit(card, [0, 0x2A, 0x9E, 0x9A], hash, false, 0, out)
                     .map_err(|e| log3ifr_ret!(ctx,f,line!(), e))?;
