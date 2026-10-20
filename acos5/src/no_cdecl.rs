@@ -92,7 +92,7 @@ use crate::constants_types::{ATR_MASK, ATR_V2, ATR_V3, BLOCKCIPHER_PAD_TYPE_ANSI
                              SC_SEC_OPERATION_GENERATE_ECCPRIVATE, SC_SEC_OPERATION_GENERATE_ECCPUBLIC,
                              prev_multiple_of, safe_int_try_from, CRYPTO, UPDATE, CardCtlEvoSmTransmit
 };
-use crate::se::{se_parse_sac, se_get_is_scb_suitable_for_sm_has_ct};
+use crate::se::{se_parse_sac, se_get_is_scb_suitable_for_sm_has_ct, se_get_sae_scb};
 use crate::path::{cut_path, file_id_from_cache_current_path, current_path_df, is_impossible_file_match};
 //use crate::missing_exports::me_get_max_recv_size;
 //use crate::cmd_card_info::is_pin_authenticated;
@@ -2569,6 +2569,34 @@ pub(crate) fn evo_key_sm_use(card: &mut sc_card, file_id: u16, scb_idx: usize, c
         0
     });
     evo_file_sm_use(card, file_id, scb, cmd)
+}
+
+/// ACOS5-EVO: SM use for a crypto command, combining the key EF's own CRYPTO SCB (when `file_id` is known)
+/// (`evo_key_sm_use`) with the current DF's SAE entry for the command. An SAE that binds the command's INS
+/// (e.g. `84 01 2A` for PSO, from `evo_init --bind-sign`) then forces SM even when the key EF SCB does not,
+/// which is the only way to require SM for ECDSA signing (the EC key EF SCBs cannot). The stronger of the
+/// two requirements wins; `cla_ins_p1_p2` is the plain command the SAE is matched against.
+///
+/// # Errors
+/// As `evo_key_sm_use` / `evo_file_sm_use`; `SC_ERROR_SECURITY_STATUS_NOT_SATISFIED` if the SAE forbids it.
+pub(crate) fn evo_crypto_sm_use(card: &mut sc_card, file_id: Option<u16>, cmd: SmCmd, cla_ins_p1_p2: [u8; 4])
+    -> Result<SmUse, i32>
+{
+    if let Some(file_id) = file_id {
+        let by_key = evo_key_sm_use(card, file_id, CRYPTO, cmd)?;
+        if by_key != SmUse::Plain { return Ok(by_key); }
+    }
+    let scb_sae = se_get_sae_scb(card, cla_ins_p1_p2);
+    if scb_sae == 0xFF {
+        let ctx = unsafe { &mut *card.ctx };
+        return Err(log3ifr_ret!(ctx, c"evo_crypto_sm_use", line!(),
+            c"the DF SAE forbids this command", SC_ERROR_SECURITY_STATUS_NOT_SATISFIED));
+    }
+    if scb_sae != 0 {
+        let df = file_id_from_path_value(&current_path_df(card));
+        return evo_file_sm_use(card, df, scb_sae, cmd);
+    }
+    Ok(SmUse::Plain)
 }
 
 /// Whether a PUT KEY status word counts as success: `90 00`, or `63 01` (key pair not consistent yet) when it is
