@@ -1,6 +1,17 @@
 # ACOS5-EVO command reference
 
-This page is for developers of the driver. It describes the commands of the ACOS5-EVO (contact interface, COS version `41 43 4F 53 05 04 32 C0`) as far as they are known. The public functional specification of the card describes its features, life cycle, and file system, but no command layouts.
+This page is for developers of the driver. It describes the commands of the ACOS5-EVO (contact interface, COS version `41 43 4F 53 05 04 32 C0`) as far as they are known.
+
+> [!IMPORTANT]
+> The commands on this page were **not** taken from the ACOS5-EVO reference manual. ACS gives that manual only on request, and it was not used for this page.
+
+The page builds on the following public sources and prior work:
+
+- The [ACOS5 page of the OpenSC wiki](https://github.com/OpenSC/OpenSC/wiki/ACOS5) and the [reference manual of the older ACOS5](https://raw.githubusercontent.com/wiki/OpenSC/OpenSC/attachments/wiki/ACOS5/ACOS5%2520Reference%2520Manual.pdf) (version 1.6) that the wiki provides. The ACOS5-EVO keeps most of these commands, but it uses other algorithm codes.
+- The earlier ACOS5 driver work for OpenSC in the [`acos5` branch of pacew/OpenSC](https://github.com/pacew/OpenSC/tree/acos5), which the wiki page names
+- This driver's support for the ACOS5-64 V2.00 and V3.00, from [carblue/acos5](https://github.com/carblue/acos5)
+- The public functional specification of the ACOS5-EVO, which describes the card's features, life cycle, and file system, but no command layouts
+- Tests with a real ACOS5-EVO card
 
 Each command carries a mark that says how far its layout is confirmed:
 
