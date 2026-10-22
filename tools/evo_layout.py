@@ -55,15 +55,19 @@ AID = b"ACOSPKCS-15v1.00"          # 41 43 4F 53 50 4B 43 53 2D 31 35 76 31 2E 3
 
 
 def piece3_app_df(user_pin: bytes, user_puk: bytes, key1: bytes | None, key2: bytes | None, *,
-                  sm: bool = False, bind: bool = False):
+                  sm: bool = False, bind: bool = False, bind_sign: bool = False):
     """Application DF 4100 with PIN, key and SE files.
 
     sm:   write the SM keys 0x81/0x82 into 4102 and create the SM test files 4104/4105.
     bind: add security attributes expanded (AB) to DF 4100 that require SM MAC+enc (SE #6) for
           VERIFY, CHANGE REFERENCE DATA and RESET RETRY COUNTER. Needs sm.
+    bind_sign: also require SM MAC (SE #5) for PSO (INS 2A) and GENERATE KEY PAIR (INS 46) in DF 4100.
+          Needs bind.
     """
     if bind and not sm:
         raise ValueError("bind needs sm")
+    if bind_sign and not bind:
+        raise ValueError("bind_sign needs bind")
     if sm and (key1 is None or key2 is None):
         raise ValueError("sm needs both keys")
     from evo_records import ct_aes, cct_aes, sym_key_record, tlv, update_binary
@@ -83,7 +87,14 @@ def piece3_app_df(user_pin: bytes, user_puk: bytes, key1: bytes | None, key2: by
     #       create DF / create EF / delete child 01 (user PIN via local SE #1; key generation creates EFs).
     # With bind, the AB object holds one entry per command: 84 01 INS 9E 01 46 (INS 20 verify,
     # 24 change reference data, 2C reset retry counter; SCB 46 = SM MAC+enc with SE #6).
-    sae = b"".join(bytes.fromhex(f"84 01 {ins:02X} 9E 01 46") for ins in (0x20, 0x24, 0x2C)) if bind else b""
+    # With bind_sign, also PSO (INS 2A) and GENERATE KEY PAIR (INS 46) with SCB 45 (SM MAC, SE #5): a DF
+    # SAE is the only way to require SM for ECDSA, which the key EF SCBs cannot do. The card refuses EC key
+    # generation under SM (69 87), so EC keys can only be imported on such a card.
+    sae = b""
+    if bind:
+        sae = b"".join(bytes.fromhex(f"84 01 {ins:02X} 9E 01 46") for ins in (0x20, 0x24, 0x2C))
+        if bind_sign:
+            sae += b"".join(bytes.fromhex(f"84 01 {ins:02X} 9E 01 45") for ins in (0x2A, 0x46))
     extra = "8D 02 41 03 " + tlv(0x84, AID).hex() + (tlv(0xAB, sae).hex() if sae else "")
     steps.append((create_file(fcp("4100", "82 02 38 00", "03 FF 03 03 01 01 01", extra=extra)), "create DF 4100"))
     steps.append((select("4100"), "select DF 4100"))

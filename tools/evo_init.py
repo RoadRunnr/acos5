@@ -7,7 +7,7 @@ All APDUs go through safecard.SafeCard, which refuses life-cycle changes,
 card activation and writes to the card header block.
 
 Usage:  evo_init.py [--yes] [--wipe-only] [--so-pin P] [--so-puk P] [--user-pin P] [--user-puk P]
-                   [--sm | --kmc-file PATH] [--bind]
+                   [--sm | --kmc-file PATH] [--bind] [--bind-sign]
 Refuses cards that are not an ACOS5-EVO. Asks before wiping unless --yes is given.
 EVO_READER=<part of the reader name> selects the reader when several are attached.
 A PUK defaults to its PIN (as in carblue's script). The OpenSC tools cannot change a PUK later.
@@ -21,6 +21,9 @@ Secure messaging is opt-in:
              written to <SERIAL>.conf, the keys are not stored.
   --bind     also require SM for VERIFY / CHANGE / RESET RETRY COUNTER and for reading the
              PKCS#15 directory files (needs --sm).
+  --bind-sign
+             also require SM for PSO (signing, deciphering) and GENERATE KEY PAIR in the
+             application DF (implies --bind). EC keys can then only be imported, not generated.
 """
 import argparse
 import os
@@ -102,7 +105,12 @@ def main():
                     help="derive the SM keys from the 32 byte master key in this file, 64 hex digits, mode 600"
                          " (implies --sm)")
     ap.add_argument("--bind", action="store_true", help="require SM for PIN commands and PKCS#15 reads (needs --sm)")
+    ap.add_argument("--bind-sign", action="store_true",
+                    help="also require SM for PSO and GENERATE KEY PAIR (implies --bind); EC keys can then only be"
+                         " imported")
     args = ap.parse_args()
+    if args.bind_sign:
+        args.bind = True
     kmc = None
     if args.kmc_file is not None:
         args.sm = True
@@ -138,7 +146,8 @@ def main():
         print("WARNING: if the SM keys are lost, files and keys bound to them become unusable;"
               " ZEROIZE and a new setup is the only recovery.")
     steps = (evo_layout.piece2_mf_and_global_files(so_pin, so_puk)
-             + evo_layout.piece3_app_df(user_pin, user_puk, key1, key2, sm=sm, bind=args.bind)
+             + evo_layout.piece3_app_df(user_pin, user_puk, key1, key2, sm=sm, bind=args.bind,
+                                        bind_sign=args.bind_sign)
              + evo_layout.piece4_pkcs15(serial, sm=sm, bind=args.bind))
     for i, (cmd, note) in enumerate(steps, 1):
         _, sw = card.tx(cmd, note, secret=isinstance(note, SecretNote))
