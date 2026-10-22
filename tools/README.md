@@ -30,6 +30,7 @@ The following table lists the files:
 | `--sm` | Writes two AES-192 keys for secure messaging to the card. The keys come from `~/.config/acos5evo/{SERIAL}.conf` if that file exists. Otherwise the tool generates random keys and writes them to that file. | off |
 | `--kmc-file {PATH}` | Derives the keys from a 32-byte master key, stored as 64 hexadecimal digits in `{PATH}`. The file must not be accessible by group or others. Implies `--sm`. | none |
 | `--bind` | Requires secure messaging for the user PIN commands and for reading the PKCS#15 files. Needs `--sm`. | off |
+| `--bind-sign` | Also requires secure messaging (MAC) for PSO commands and key generation in the PKCS#15 application. Implies `--bind`. The card then cannot generate EC keys, so import them. Only RSA keys created with `+bound` can decrypt. | off |
 | `--wipe-only` | Wipes the card and creates nothing. | off |
 | `--yes` | Wipes without asking. | off |
 

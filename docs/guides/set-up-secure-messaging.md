@@ -23,7 +23,7 @@ Run the following command to initialize the card with random SM keys and bind it
 python3 tools/evo_init.py --user-pin {USER_PIN} --user-puk {USER_PUK} --so-pin {SO_PIN} --so-puk {SO_PUK} --sm --bind
 ```
 
-The tool writes the keys to `~/.config/acos5evo/{SERIAL}.conf` with mode 600. The file holds a `card` sub-block for `opensc.conf`. Leave out `--bind` if the card should work without SM keys for PIN commands. For the setup options, see [Initialize a card](initialize-a-card.md#choose-the-setup).
+The tool writes the keys to `~/.config/acos5evo/{SERIAL}.conf` with mode 600. The file holds a `card` sub-block for `opensc.conf`. Leave out `--bind` if the card should work without SM keys for PIN commands. Use `--bind-sign` instead of `--bind` to also require secure messaging for every signature and key generation on the card. With `--bind-sign`, import EC keys, because the card cannot generate them in that setup, and create RSA keys for decryption with `+bound`. For the setup options, see [Initialize a card](initialize-a-card.md#choose-the-setup).
 
 ## Add the keys to opensc.conf
 
