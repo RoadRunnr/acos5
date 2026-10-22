@@ -26,7 +26,7 @@ The following features were tested with an ACOS5-EVO smart card in a CCID reader
 - EC key generation and ECDSA signing for P-224, P-256, P-384, and P-521
 - Private key import for RSA-2048 and EC P-256 keys
 - Certificates, PIN change and unblock, key deletion, and `pkcs15-init --sanity-check`
-- Secure messaging with AES keys, including PIN commands and RSA keys bound to secure messaging
+- Secure messaging with AES keys, including PIN commands, RSA keys bound to secure messaging, and signing bound to secure messaging for all keys (`--bind-sign`)
 - OpenSSH with `ssh-agent`, the OpenSSL `pkcs11-provider`, and NSS
 
 The driver does not support these functions on the ACOS5-EVO:

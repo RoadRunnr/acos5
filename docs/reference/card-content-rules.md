@@ -67,6 +67,8 @@ The local SE file `4103` holds the following records. The access conditions of f
 | 5 | Secure messaging with MAC |
 | 6 | Secure messaging with MAC and encryption |
 
+With `--bind`, the application directory `4100` has security attributes that require secure messaging with MAC and encryption for the user PIN commands. With `--bind-sign`, they also require secure messaging with a MAC for PSO commands (signing, decryption) and for GENERATE KEY PAIR.
+
 The PKCS#15 directory files and EF.ODF and EF.TokenInfo need no PIN to read or write. With `--bind`, reading them needs secure messaging with a MAC. The certificate directory file `4114` holds 6 KB, because the driver stores certificates inside it.
 
 The card stays in its manufacturer stage. In that stage the card enforces all access conditions, and the MF can always be deleted. You can therefore always wipe and initialize the card again.

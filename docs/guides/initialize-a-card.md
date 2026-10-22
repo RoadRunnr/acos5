@@ -28,6 +28,7 @@ Before you initialize an ACOS5-EVO, make sure you have the following:
 | Plain | none | A card that needs no secure messaging. The PINs go to the card in plain text. |
 | Secure messaging keys | `--sm` | A card that has secure messaging keys. Single keys and files can require secure messaging. |
 | Bound | `--sm --bind` | A card that works only with hosts that have its secure messaging keys. The user PIN goes to the card only encrypted. |
+| Bound with signing | `--sm --bind-sign` | Like bound, and every signature and key generation on the card needs secure messaging. The card cannot generate EC keys in this setup, so import them. Only RSA keys created with `+bound` can decrypt. |
 
 For what secure messaging protects and what it does not protect, see [Secure messaging](../concepts/secure-messaging.md).
 

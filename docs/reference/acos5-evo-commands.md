@@ -95,7 +95,7 @@ The following table lists the known commands:
 | `00 2A 84 80` | PSO ENCIPHER | U |
 | `00 2A 00 A8` | PSO VERIFY DIGITAL SIGNATURE | N |
 | `00 2A 90 80` | PSO HASH | N |
-| `00 2A 8E 80` | PSO COMPUTE CRYPTOGRAPHIC CHECKSUM | N |
+| `00 2A 8E 80` | PSO COMPUTE CRYPTOGRAPHIC CHECKSUM | V |
 | `00 2A 00 A2` | PSO VERIFY CRYPTOGRAPHIC CHECKSUM | N |
 | `00 2A 90 9E` | PSO RECOVER SIGNED DATA | N |
 | `80 DA` | PUT KEY | V |
@@ -235,7 +235,7 @@ SE record 4 of the layout of `tools/evo_init.py` (`A4 09 83 01 81 83 01 01 95 01
 
 #### Security attributes expanded
 
-The SAE (tag `AB`) applies only to the MF and DFs and governs the commands in that DF (N). Verified (V): an SAE on an EC key EF is accepted by CREATE FILE but not enforced, and the SAE on DF 4100 is enforced. The SAE holds at most 32 bytes: pairs of an access mode data object (AMDO) and security condition data objects (SCDO), repeated. The following table lists the data objects:
+The SAE (tag `AB`) applies only to the MF and DFs and governs the commands in that DF (N). Verified (V): an SAE on an EC key EF is accepted by CREATE FILE but not enforced. An SAE on a DF binds every INS it names. With `AB 06 84 01 2A 9E 01 45` on a DF, the card refuses a plain PSO (INS `2A`) in that DF with `69 82` and accepts it under SM with a MAC. This also holds for ECDSA signing, which the key EF SCBs cannot bind. `tools/evo_init.py --bind-sign` uses it for PSO and GENERATE KEY PAIR in DF 4100. The SAE holds at most 32 bytes: pairs of an access mode data object (AMDO) and security condition data objects (SCDO), repeated. The following table lists the data objects:
 
 | Item | Meaning |
 | --- | --- |
@@ -306,9 +306,16 @@ Details that are not verified (N):
 - One command does both directions. No separate INTERNAL AUTHENTICATE step exists on this path.
 - An SE record can make the authenticated key an access condition: `A4 06 83 01 <key ID> 95 01 80` (usage `80` = key authenticated, `08` = PIN verified, `88` = both). The key ID is written without the local bit (key `81` as `01`). An SCB that points at such a record then requires a mutual authentication with that key.
 
-The functional specification (sections 5.5 and 5.6) says that mutual authentication uses two keys of the same algorithm and length, a card key KC and a terminal key KT. It also says the card generates a session key KS automatically after the procedure, for AES or 3DES. The card keeps KS internal, so the host must derive the same KS to use it. The derivation is not known.
+The functional specification (sections 5.5 and 5.6) says that mutual authentication uses two keys of the same algorithm and length, a card key KC and a terminal key KT. It also says the card generates a session key KS automatically after the procedure, for AES or 3DES. The card keeps KS internal, so the host must derive the same KS to use it.
 
-An SE record refers to the session key with `84 00` in its CCT or CT. Verified (V): a file whose read SCB points at such a record refuses an SM read with `69 87` before any mutual authentication. After a successful mutual authentication, the card still refuses a MAC computed with either static key with `69 88`. The functional specification (section 6.2) says SM for authenticity is not replayable. That holds only for the session key path, because the static key MAC does not include the challenge (see [Secure messaging](#secure-messaging)).
+An SE record refers to the session key with `84 00` in its CCT or CT, without `83`. A CCT with both `83` and `84` gets `69 87` for an SM read, before and after a mutual authentication. Verified (V) for a CCT with `84 00` and no `83`:
+
+- Before any mutual authentication in the card session, an SM read gets `69 87` (no session key).
+- After a mutual authentication, a wrong MAC gets `69 88`. The session key stays for later commands without a new authentication.
+- With 3DES keys, the session key is known and works. See [3DES session key](#3des-session-key-v).
+- With AES keys, the card accepts both authentication forms and forms a session key, but its derivation is not known. The 3DES derivation with 8-byte halves of the 16-byte challenges does not match.
+
+The functional specification (section 6.2) says SM for authenticity is not replayable. That holds for the session key path and for 3DES, but not for the static AES key, because the static AES MAC does not include the challenge (see [Secure messaging](#secure-messaging)).
 
 The older ACOS5 derived its DES and 3DES session keys as follows (N). Let RE = E(RNDc) under KT and RI = E(RNDt) under KC. The 3DES session key is `KsL || KsR`:
 
@@ -317,7 +324,30 @@ KsL = KC(left)  * RE  * KT(left)  * RI
 KsR = KC(right) * ~RE * KT(right) * ~RI
 ```
 
-For single DES, `KS = KC * RE * KT * RI`. The operator `*` is not defined, and XOR is the likely reading.
+For single DES, `KS = KC * RE * KT * RI`. The operator `*` is not defined. With XOR as the operator, this formula does not match on the ACOS5-EVO (V: `69 88`).
+
+#### 3DES session key (V)
+
+The 3DES session key works on the ACOS5-EVO with the derivation of the driver's ACOS5-EVO branch (`sm_cwa_initialize`). It was tested with two 2-key 3DES keys in the key file of a DF: key `81` = KT and key `82` = KC, record algorithm `14`. The test file's read SCB points at an SE record with CCT `B4 08 84 00 95 01 30 80 01 13`.
+
+1. GET CHALLENGE `00 84 00 00 08` gives RNDc.
+2. EXTERNAL AUTHENTICATE `00 82 00 81 08 3DES(KT, RNDc)` gives `90 00`.
+3. INTERNAL AUTHENTICATE `00 88 00 82 08 RNDt` gives `61 08`. GET RESPONSE returns 3DES(KC, RNDt).
+4. Compute `D = RNDc[4:8] RNDt[0:4] || RNDc[0:4] RNDt[4:8] || RNDc[0:4] RNDt[4:8]`. The session MAC key is `3DES-ECB(KT, D)` and the session encryption key `3DES-ECB(KC, D)`, each 24 bytes with odd parity.
+5. Send each SM command in the static 3DES format (see [Secure messaging with a static 3DES key](#secure-messaging-with-a-static-3des-key-v)) with the session keys: GET CHALLENGE 8 = SSC, command MAC with IV = SSC+1, response MAC with IV = SSC+2.
+
+With a CT `B8 08 84 00 95 01 30 80 01 13` next to the CCT, encrypted READ BINARY and UPDATE BINARY work as with a static key. The single combined command `00 82 00 81 10 RNDt || E(RNDc)` with one key also works: the same derivation then uses KT = KC = that key.
+
+Observed details:
+
+- The second and third 8-byte blocks of D are equal, so both keys have the form K1 || K2 || K2. 3DES-EDE with K3 = K2 is single DES under K1, so each session key is a 56-bit DES key in effect.
+- The MAC key depends only on KT, the encryption key only on KC.
+- The card needs a GET CHALLENGE before each SM command. The driver's framing for the older ACOS5 (SSC = RNDc, no new GET CHALLENGE) gets `69 85`.
+- An initial value `87 08` in the CCT does not change the MAC IV. The card still uses SSC+1.
+- The driver's branch for the older ACOS5 (D ends with `RNDt[0:4] RNDc[4:8]`) gets `69 88`.
+- A command sent again unchanged gets `69 88`, right after the original command and after a new GET CHALLENGE.
+
+The driver's ACOS5-EVO secure messaging uses the static AES keys and does not use session keys.
 
 #### The driver's 3DES path
 
@@ -345,11 +375,11 @@ The following table lists the commands and the card's answers:
 
 RNDt is an 8-byte host random. A correct cryptogram after a wrong one gives `90 00` again. The key references are local (bit 7 set) and refer to the key file of the current DF.
 
-Not tested: the session key after this flow, and the combined form `00 82 00 ref 10 RNDt || E(RNDc)` of the older card.
+The combined form of the older card works too: after GET CHALLENGE 8, `00 82 00 81 10 RNDt || 3DES(K, RNDc)` gives `61 08`, and GET RESPONSE returns 3DES(K, RNDt). After either form, the 3DES session key works (see [3DES session key](#3des-session-key-v)).
 
 ### INTERNAL AUTHENTICATE `00 88 00 ref 08 RNDt` (V)
 
-The card encrypts the 8-byte host challenge RNDt with the 3DES key `ref` and answers `61 08`. GET RESPONSE returns 3DES-ECB(K, RNDt). Under T=0 the host sends the command without Le. Not tested with an AES key.
+The card encrypts the 8-byte host challenge RNDt with the 3DES key `ref` and answers `61 08`. GET RESPONSE returns 3DES-ECB(K, RNDt). Under T=0 the host sends the command without Le. With an AES key (V), `00 88 00 82 10 RNDh` gives `61 10`, and GET RESPONSE returns AES-ECB(K, RNDh). EXTERNAL AUTHENTICATE with AES is `00 82 00 81 10 AES(KT, RNDc)` after GET CHALLENGE 16 and gives `90 00` (V).
 
 ### MANAGE SECURITY ENVIRONMENT `00 22 01 tag Lc CRT` (D)
 
@@ -401,7 +431,7 @@ The following table lists the control reference data objects (table 33) and thei
 | `81` | File reference | Used (key EF) |
 | `82` | DF name | Not used |
 | `83` | Secret key reference, public key reference, or reference data qualifier | Used (symmetric key, PIN in AT) |
-| `84` | Private key reference, or reference for computing a session key | `84 00` requires the session key (V, see [MUTUAL AUTHENTICATE](#mutual-authenticate-00-82-00-ref-20-rndh--erndc-v)). Otherwise not used. |
+| `84` | Private key reference, or reference for computing a session key | `84 00` in a CCT or CT selects the session key (V, see [3DES session key](#3des-session-key-v)). Not together with `83`: the card then answers `69 87`. |
 | `85` to `87` | Initial check block (`87` with L = k: initial value) | `87` used (IV) |
 | `88` to `93` | Auxiliary data (challenge, counters, time stamp) | Not used |
 | `94` | Challenge or data element for deriving a key | Not used |
@@ -420,7 +450,7 @@ The following table lists the algorithm references:
 | DST `B6` | `41` | ECDSA verify (PSO VERIFY DIGITAL SIGNATURE) | N |
 | CT `B8` | `24` | RSA decipher / encipher | D |
 | CT `B8` | `10` / `11` | DES ECB / CBC | U |
-| CT `B8` | `12` / `13` | 3DES ECB / CBC | U |
+| CT `B8` | `12` / `13` | 3DES ECB / CBC (`13` verified in an SM CT with a static 3DES key and with the session key) | U / V |
 | CT `B8` | `14` / `15` | AES ECB / CBC (`15` verified in an SM CT) | U / V |
 | CCT `B4` | `1D` | AES CMAC (verified in an SM CCT) | V |
 | CCT `B4` | `13` | 3DES MAC (verified in an SM CCT with a static 3DES key) | V |
@@ -433,7 +463,7 @@ The following details are not verified (N):
 
 - MSE uses only P1 `01` with the tags `B6` (DST), `B8` (CT), and `AA` (HT). AT `A4` and CCT `B4` appear only in SE records. No MSE with a KAT `A6` is known.
 - The data objects in an MSE are only `80`, `81`, `83`, `87`, and `95`.
-- The usage byte for sign, verify, and decipher can be `95 01 C0` instead of `40`. Whether the card treats `C0` differently from `40` is not tested.
+- The usage byte for sign, verify, and decipher can be `95 01 C0` instead of `40`. Verified (V) for EC signing: a DST with `95 01 C0` gives the same valid signature as with `40`.
 - A symmetric CT has the form `B8 L 80 01 <algo> 87 L <IV> 83 01 <keyref> 95 01 <usage>`, where `<keyref>` is the key reference without the local bit `80` (key `81` is written as `01`).
 - No CT is known for EC keys.
 
@@ -493,7 +523,7 @@ EC: `00 46 00 00 01 <curve>`, with curve `01` P-224, `02` P-256, `03` P-384, `04
 
 RSA-4096 generation took more than ten minutes on an ACOS5-EVO.
 
-SM form: `0C 46` with the data in a plain `81` object (MAC only), after plain MSEs. It works (V) for RSA-2048 on key EFs whose SCBs require SM. The card refuses it with `69 87` on key EFs without SM in their SCBs, and for EC keys whatever the SCBs or SAE.
+SM form: `0C 46` with the data in a plain `81` object (MAC only), after plain MSEs. It works (V) for RSA-2048 on key EFs whose SCBs require SM. The card refuses it with `69 87` on key EFs without SM in their SCBs, and for EC keys in every case tested, also under a DF SAE that requires SM for INS `46`. Under such an SAE the card refuses the plain form too (`69 82`), so EC keys cannot be generated in that DF. Import them instead.
 
 ### GET KEY `80 CA P1 P2 Le` (V)
 
@@ -501,7 +531,7 @@ Reads the key EF that is selected or referenced. P1 P2 is the offset. Le is at m
 
 The key EF's read SCB controls GET KEY. The driver creates public key EFs with read always, so GET KEY works on them. It creates private key EFs with read never, so GET KEY on them returns `69 82`, even after a verified user PIN. The private key is therefore not readable in the driver's layout.
 
-SM form (V): `8C CA P1 P2` with `97 01 Le`. `0C CA` gives `6D 00`. On an RSA-2048 public key EF with read SCB `45` (SM MAC), the card answers with the data in a plain `81` object. Le `E0` works: the 277-byte public key record comes in two chunks, at offsets `0000` and `00E0`. Le `FF` is refused with `69 88`. On a public key EF with read always, the card refuses the SM form with `69 87`.
+SM form (V): `8C CA P1 P2` with `97 01 Le`. `0C CA` gives `6D 00`. On an RSA-2048 public key EF with read SCB `45` (SM MAC), the card answers with the data in a plain `81` object. Le `E0` works: the 277-byte public key record comes in two chunks, at offsets `0000` and `00E0`. Le `F0` returns 240 bytes, the limit. Le `FF` is refused with `69 88`. On a public key EF with read always, the card refuses the SM form with `69 87`.
 
 EC public key EF content:
 
@@ -567,7 +597,7 @@ The data and response are the following:
 - RSA: the data is a DigestInfo, or the raw hash for SHA-1 and SHA-256. The card adds the PKCS#1 v1.5 padding. The response is the signature (256 or 512 bytes, in several GET RESPONSE rounds).
 - ECDSA: the data is the raw hash, truncated to the field size by the host. The response is r || s (56, 64, 96, or 132 bytes for P-224, P-256, P-384, P-521).
 
-SM form: `0C 2A 9E 9A` with the hash in `81` (MAC only), after a plain MSE. On an RSA-2048 key EF whose crypto SCB requires SM, it works (V). The card returns the 256-byte signature encrypted, as one CBC ciphertext with padding indicator `00`. The ciphertext is split across two `87` objects: `87 FE 00 <253 bytes>` and `87 04 00 <3 bytes>`. The inner SW in the `99` object is `61 00`, although the whole signature is there. The card refuses the SM form with `69 87` on key EFs without SM in their crypto SCB, and on EC key EFs whatever their SCBs or SAE.
+SM form: `0C 2A 9E 9A` with the hash in `81` (MAC only), after a plain MSE. On an RSA-2048 key EF whose crypto SCB requires SM, it works (V). The card returns the 256-byte signature encrypted, as one CBC ciphertext with padding indicator `00`. The ciphertext is split across two `87` objects: `87 FE 00 <253 bytes>` and `87 04 00 <3 bytes>`. The inner SW in the `99` object is `61 00`, although the whole signature is there. The card refuses the SM form with `69 87` on key EFs without SM in their crypto SCB, unless a DF SAE requires SM for INS `2A`. The SCBs of an EC key EF and an SAE on the EC key EF never make the card accept SM. Under a DF SAE `84 01 2A 9E 01 45`, ECDSA works only in the SM form (V): the plain form gets `69 82`, and the SM form returns the 64-byte P-256 signature in the SM response with inner SW `61 40`.
 
 ### PSO DECIPHER `00 2A 80 84 Lc cryptogram` (D)
 
@@ -605,7 +635,13 @@ PSO COMPUTE DIGITAL SIGNATURE with Lc `00` (`00 2A 9E 9A 00`) signs the hash of 
 
 ### PSO COMPUTE CRYPTOGRAPHIC CHECKSUM `00 2A 8E 80 Lc data` (N)
 
-Computes a MAC over the data with the key and IV of the CCT set by MSE. The data has `08` to `F8` bytes, a multiple of the block size. Longer data takes CLA `10` on all blocks but the last. The response is `61 XX`, and GET RESPONSE returns the checksum.
+Computes a MAC over the data with the key and algorithm of the CCT set by MSE. The response is `61 XX`, and GET RESPONSE returns the checksum.
+
+Verified (V) with AES-CMAC: the MSE is `00 22 01 B4 08 80 01 1D 83 01 <key> 95 01 40`, and the PSO data is `80 L <data>`. The response is the full 16-byte AES-CMAC over the whole `80 L <data>` field, not truncated. With `84 00` instead of `83 01 <key>` in the CCT, the card computes the checksum under the session key, without secure messaging on the command.
+
+A CT for a symmetric PSO ENCIPHER is not available: the MSE is accepted, but PSO ENCIPHER `00 2A 86 80` and `00 2A 84 80` return `6A 86`. The algorithm codes `04` and `06` of the older card are refused at MSE with `6A 80`.
+
+Not verified (N): the data has `08` to `F8` bytes, a multiple of the block size, and longer data takes CLA `10` on all blocks but the last.
 
 ### PSO VERIFY CRYPTOGRAPHIC CHECKSUM `00 2A 00 A2 Lc 80 L data 8E L cc` (N)
 
@@ -652,11 +688,11 @@ READ BINARY and UPDATE BINARY are verified with MAC only and with MAC and encryp
 
 Limits of the format:
 
-- At most 240 bytes of plain data per command and per response (N). Verified (V): GET KEY under SM works with Le `E0` and is refused with `69 88` for Le `FF`. PSO DECIPHER works with 223 data bytes per block (233 bytes of SM data).
+- At most 240 bytes of plain data per command and per response (N). Verified (V): GET KEY under SM returns 224 bytes for Le `E0` and 240 bytes for Le `F0`, and is refused with `69 88` for Le `FF`. PSO DECIPHER works with 223 data bytes per block (233 bytes of SM data).
 - Longer response data is split into several data objects (V: `87 FE` + `87 04` for a 256-byte result).
 - The padding indicator `00` means no padding, `01` means padded (V: the card sends `00` for 256 bytes).
 - The `99` object carries the SW of the plain command, for example `61 00` (V).
-- On the ACOS5-EVO, VERIFY, CHANGE REFERENCE DATA, and RESET RETRY COUNTER work under SM (V). The card refuses SM for EC GENERATE KEY PAIR and ECDSA signing with `69 87` (V). Not verified on the ACOS5-EVO (N): SM for CREATE FILE, ERASE BINARY, ACTIVATE and DEACTIVATE FILE, TERMINATE DF and EF, MSE, and READ RECORD.
+- On the ACOS5-EVO, VERIFY, CHANGE REFERENCE DATA, and RESET RETRY COUNTER work under SM (V). The card refuses SM for EC GENERATE KEY PAIR with `69 87` (V). It accepts SM for ECDSA signing only where a DF SAE requires SM for INS `2A` (V). Not verified on the ACOS5-EVO (N): SM for CREATE FILE, ERASE BINARY, ACTIVATE and DEACTIVATE FILE, TERMINATE DF and EF, MSE, and READ RECORD.
 
 ### Commands the driver sends under secure messaging
 
@@ -673,12 +709,13 @@ The following table lists the commands that the driver sends under SM. It sends 
 | PSO COMPUTE DIGITAL SIGNATURE | `0C 2A 9E 9A`, `81` | RSA key created with `+bound` |
 | PSO DECIPHER | `1C 2A 80 84` for every block but the last, `0C 2A 80 84` for the last, each block of up to 223 bytes wrapped on its own | RSA key created or imported with `+bound` |
 | PUT KEY | `8C DA`, encrypted `87` | RSA key imported with `+bound` |
+| PSO COMPUTE DIGITAL SIGNATURE (RSA and ECDSA), GENERATE KEY PAIR (RSA) | `0C 2A 9E 9A` / `0C 46`, `81` (MAC only) | The DF SAE requires SM for INS `2A` / `46` (`--bind-sign`) |
 
 These commands always stay plain:
 
 - SELECT, MSE, GET CARD INFO, and GET CHALLENGE
 - PSO DECIPHER with a key whose crypto SCB does not require SM
-- The commands on EC keys in the layout of `tools/evo_init.py`
+- The commands on EC keys, except on a card initialized with `--bind-sign`
 - The SO PIN commands on the global PIN file (ref `01`, at the MF). The `--bind` SAE is on DF 4100 only, so mode `transmit` refuses the SO PIN commands.
 
 PSO COMPUTE DIGITAL SIGNATURE with a `+bound` RSA key goes under SM on the driver's own signing path. That path takes a PKCS#1 v1.5 DigestInfo for SHA-1, SHA-224, SHA-256, SHA-384, or SHA-512 and sends the hash in `81`. Only SHA-256 is tested end to end. A DigestInfo for another digest algorithm takes the fallback through decipher: the driver adds the PKCS#1 v1.5 padding and sends PSO DECIPHER. For a `+bound` key, that PSO DECIPHER goes under SM, and the driver keeps the raw result. This fallback was tested with RIPEMD160-RSA-PKCS.
@@ -695,7 +732,7 @@ The format is the AES format with 8-byte blocks:
 - The command MAC is the first 4 bytes of 3DES-CBC with IV = SSC+1 over `pad(89 04 CLA^0C INS P1 P2) || pad(DOs)`, with the padding `80 00..` to a multiple of 8.
 - The response MAC uses the same algorithm with IV = SSC+2, over everything before `8E`.
 
-Unlike the AES MAC, the 3DES MAC depends on the challenge: the same command with IV = SSC gives `69 88`. Not tested: sending a recorded command again after a new GET CHALLENGE.
+Unlike the AES MAC, the 3DES MAC depends on the challenge: the same command with IV = SSC gives `69 88`. A command sent again unchanged gets `69 88`, right after the original command and after a new GET CHALLENGE (V). So static 3DES SM commands cannot be replayed, unlike static AES SM commands.
 
 The card refuses these forms with `69 88`:
 
@@ -705,7 +742,7 @@ The card refuses these forms with `69 88`:
 - Header and data objects padded together
 - CCT algorithm `11` or `1D` with the same 3DES key
 
-Not tested: 3DES encryption in a CT `B8`, and the 3DES session key (CCT `84 00`).
+3DES encryption with a static key in a CT `B8` (algorithm `13`) works (V). An SM READ BINARY returns `87 L 00 <3DES-CBC(key, IV = SSC+2, data)>`, and an SM UPDATE BINARY sends `87` encrypted with IV = SSC+1, as for AES. The 3DES session key (CCT `84 00`) works too, see [3DES session key](#3des-session-key-v).
 
 ## GET CARD INFO `80 14 P1 P2 [Le]` (V)
 

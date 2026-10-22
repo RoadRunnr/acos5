@@ -23,7 +23,7 @@ Secure messaging has the following limits:
 - Someone who records a command can send it to the card again, because the MAC does not include the challenge. Encryption does not prevent that either. Use encryption where the data must stay secret.
 - Every command uses the same static key. The card has no session keys.
 - An attacker who controls the host can read the keys in `opensc.conf`.
-- Operations with EC keys go to the card in plain text with the layout that `tools/evo_init.py` creates.
+- Operations with EC keys go to the card in plain text, unless the card was initialized with `--bind-sign`.
 
 ## Modes
 
@@ -48,11 +48,19 @@ A host without the SM keys cannot read the PKCS#15 files or verify the user PIN,
 
 The card keeps no record that it is bound. Keys that you create later need the `+bound` profile option to require secure messaging for themselves.
 
+## Binding signing to the hosts
+
+`tools/evo_init.py --bind-sign` binds the card as `--bind` does. It also requires secure messaging with a MAC for every PSO command (signing, decryption) and for key generation in the PKCS#15 application. The requirement covers all keys, EC keys included, without the `+bound` option. The driver reads this requirement from the card and sends these commands under secure messaging.
+
+The card refuses EC key generation under secure messaging, and the binding refuses it in plain text. On a card initialized with `--bind-sign`, import EC keys instead of generating them. RSA keys can be generated.
+
+The binding requires a MAC, but no encryption. The driver sends decryption under secure messaging only with encryption, so on such a card only RSA keys created with `+bound` can decrypt. Their own access condition requires encryption. A `+bound` RSA key also still needs the user PIN together with secure messaging.
+
 ## Bound keys
 
 A key created with the profile option `+bound` requires the user PIN and secure messaging together. The card refuses such a key in plain text even after a correct PIN, and it refuses the key under secure messaging without the PIN. The requirement covers signing, decryption, generation, and import. The driver sends each of these commands under secure messaging.
 
-`+bound` works for RSA keys only. `pkcs15-init` refuses `+bound` for EC keys. A `+bound` key needs a card with SM keys (`--sm`). The card does not have to be bound with `--bind`.
+`+bound` works for RSA keys only. `pkcs15-init` refuses `+bound` for EC keys. To bind EC keys, initialize the card with `--bind-sign`. A `+bound` key needs a card with SM keys (`--sm`). The card does not have to be bound with `--bind`.
 
 ## Where the keys come from
 
