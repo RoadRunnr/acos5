@@ -93,6 +93,10 @@ class SafeCard:
             self.reader = matches[0]
         self.protocol = protocol
         rv, self.h, self.proto = SCardConnect(self.ctx, self.reader, SCARD_SHARE_EXCLUSIVE, protocol)
+        if rv != SCARD_S_SUCCESS and protocol == SCARD_PROTOCOL_T0:
+            # the contactless interface offers only T=1; fall back to it (evo_init.py sends no case 4 APDU)
+            self.protocol = SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1
+            rv, self.h, self.proto = SCardConnect(self.ctx, self.reader, SCARD_SHARE_EXCLUSIVE, self.protocol)
         self._ok(rv, "connect")
         self.log(f"=== connect {self.reader} proto={self.proto}")
 
