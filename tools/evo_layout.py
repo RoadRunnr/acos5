@@ -175,12 +175,29 @@ def piece4_pkcs15(serial: bytes, label: bytes = b"ACOS5-EVO", *, sm: bool = Fals
                                           + tlv(0x02, bytes([kid])) + tlv(0x80, b"\x1E")))))
             for kid, name in ((1, b"SM1"), (2, b"SM2"))),
     }
-    # EF.AODF: user PIN (local 0x81) and SO PIN (global 0x01), as in carblue.
-    content["4118"] = bytes.fromhex(
-        "30 35 30 0A 0C 04 55 73 65 72 03 02 06 C0 30 03 04 01 01 A1 22 30 20 03 03 04 CC 00 0A 01 01"
-        " 02 01 04 02 01 08 02 01 08 80 02 00 81 04 01 FF 30 06 04 04 3F 00 41 00"
-        " 30 30 30 08 0C 02 53 4F 03 02 06 C0 30 03 04 01 02 A1 1F 30 1D 03 03 04 8F 00 0A 01 01"
-        " 02 01 04 02 01 08 02 01 08 80 01 01 04 01 FF 30 04 04 02 3F 00")
+    # EF.AODF: user PIN (local 0x81), SO PIN (global 0x01) and the user PUK (unblocks the user PIN).
+    # A PKCS#15 PIN object is SEQUENCE { commonObjectAttributes, commonAuthObjectAttributes, [1] pinAttributes }.
+    # commonObjectAttributes is SEQUENCE { label, flags, authId OPTIONAL }; its authId links a PIN to its PUK
+    # (OpenSC finds the PUK with sc_pkcs15_find_pin_by_auth_id on the PIN's object authId). commonAuthObject-
+    # Attributes is SEQUENCE { authId } and holds the object's own identifier.
+    def auth_pin_obj(label, obj_id, pin_flags, ref_bytes, path_fid, obj_auth_id=None):
+        coa = tlv(0x0C, label) + bytes.fromhex("03 02 06 C0")
+        if obj_auth_id is not None:
+            coa += tlv(0x04, bytes([obj_auth_id]))             # link to the PUK object
+        common = tlv(0x30, coa) + tlv(0x30, tlv(0x04, bytes([obj_id])))
+        pin_attr = (bytes.fromhex(pin_flags) + bytes.fromhex("0A 01 01")   # pinFlags, pinType
+                    + bytes.fromhex("02 01 04 02 01 08 02 01 08")          # min / stored / max length
+                    + bytes.fromhex(ref_bytes) + bytes.fromhex("04 01 FF") # pinReference, padChar
+                    + tlv(0x30, tlv(0x04, bytes.fromhex(path_fid))))       # path
+        return tlv(0x30, common + tlv(0xA1, tlv(0x30, pin_attr)))
+
+    content["4118"] = (
+        # user PIN, id 01, ref 0x81, flags case-sensitive+local+initialized+needs-padding; object authId 03 -> PUK
+        auth_pin_obj(b"User", 0x01, "03 03 04 CC 00", "80 02 00 81", "3F00 4100", obj_auth_id=0x03)
+        # SO PIN, id 02, ref 0x01, flags + unblockingPin + soPin
+        + auth_pin_obj(b"SO", 0x02, "03 03 04 8F 00", "80 01 01", "3F00")
+        # user PUK, id 03, ref 0x81 (the resetting code in the user PIN's record), flags + unblockingPin
+        + auth_pin_obj(b"User PUK", 0x03, "03 03 04 CE 00", "80 02 00 81", "3F00 4100"))
     read_scb = "45" if bind else "00"
     for fid, size in dfs:
         steps.append((create_file(fcp(fid, "82 02 01 00", f"00 FF 00 03 FF 00 {read_scb}", extra="80 02 " + size)),
