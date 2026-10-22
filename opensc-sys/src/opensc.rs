@@ -1041,6 +1041,9 @@ pub const SC_CARD_CAP_ONCARD_SESSION_OBJECTS : c_ulong = 0x0000_0400;
 pub const SC_CARD_CAP_WRAP_KEY   : c_ulong = 0x0000_0800;
 /* Card (or card driver) supports key unwrapping operations */
 pub const SC_CARD_CAP_UNWRAP_KEY : c_ulong = 0x0000_1000;
+/* Card rejects a short case 4 APDU that carries Le under T=1; send without Le.
+   Needs OpenSC with the SC_CARD_CAP_CASE4_SHORT_NO_LE support patch. */
+pub const SC_CARD_CAP_CASE4_SHORT_NO_LE : c_ulong = 0x0000_2000;
 
 /* Card supports symmetric/secret key algorithms (currently at least AES, modes ECB and CBC) */
 // #[cfg(sym_hw_encrypt)]

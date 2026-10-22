@@ -103,6 +103,9 @@ pub(crate) const ATR_V4_2    : &CStr = c"3b:9e:96:80:01:41:05:42:00:00:00:00:00:
 pub(crate) const ATR_V4_3    : &CStr = c"3b:9e:96:80:01:41:05:43:00:00:00:00:00:00:00:00:00:90:00:1e"; // Using reader with a card: ACS CryptoMate EVO 00 00 ; Card status (0x0034): Present, Powered, 'PTS is negotiable'; The active protocol (0x0002) is T=1 ; reported by my CryptoMate EVO
 pub(crate) const ATR_MASK    : &CStr = c"FF:FF:00:FF:FF:FF:FF:FF:00:00:00:00:00:00:00:00:00:FF:FF";
 pub(crate) const ATR_MASK_TCK: &CStr = c"FF:FF:00:FF:FF:FF:FF:F0:00:00:00:00:00:00:00:00:00:FF:FF:00";
+// Contactless (ISO 14443-4) pseudo-ATR of the dual-interface ACOS5-EVO: no TA1 byte, 19 bytes.
+pub(crate) const ATR_V4_3_CL : &CStr = c"3b:8e:80:01:41:05:43:00:00:00:00:00:00:00:00:00:90:00:98";
+pub(crate) const ATR_MASK_TCK_CL: &CStr = c"FF:FF:FF:FF:FF:FF:F0:00:00:00:00:00:00:00:00:00:FF:FF:00";
 pub(crate) const NAME_V2  : &CStr = c"ACOS5-64 V2.00: Smart Card or CryptoMate64";
 pub(crate) const NAME_V3  : &CStr = c"ACOS5-64 V3.00: Smart Card or CryptoMate Nano";
 pub(crate) const NAME_V4  : &CStr = c"ACOS5-EVO V4.X0: Smart Card EVO or CryptoMate EVO";

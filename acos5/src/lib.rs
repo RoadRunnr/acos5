@@ -402,6 +402,7 @@ use opensc_sys::opensc::{sc_card, sc_card_driver, sc_card_operations, sc_securit
                          SC_ALGORITHM_RSA_PAD_PKCS1,
                          SC_ALGORITHM_RSA_PAD_ISO9796, SC_SEC_ENV_ALG_REF_PRESENT, SC_SEC_ENV_ALG_PRESENT,
                          SC_ALGORITHM_3DES, SC_ALGORITHM_DES, SC_RECORD_BY_REC_NR, SC_CARD_CAP_ISO7816_PIN_INFO,
+                         SC_CARD_CAP_CASE4_SHORT_NO_LE,
                          SC_ALGORITHM_AES, SC_ALGORITHM_EXT_EC_NAMEDCURVE, SC_CARD_CAP_APDU_EXT, SC_ALGORITHM_EC,
                          SC_PROTO_T1, SC_ALGORITHM_EXT_EC_COMPRESS, safe_sc_check_sw, safe_sc_transmit_apdu};
 #[cfg(not(any(v0_20_0, v0_21_0, v0_22_0, v0_23_0, v0_24_0, v0_25_0, v0_25_1, v0_26_0, v0_26_1)))]
@@ -1015,6 +1016,13 @@ fn acos5_init(card: &mut sc_card, ctx: &mut sc_context, reader: &mut sc_reader) 
     */
     if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 && reader.active_protocol == SC_PROTO_T1 {
         card.caps |= SC_CARD_CAP_APDU_EXT;
+    }
+    /* The ACOS5-EVO answers 67 00 to a short case 4 APDU that carries Le under T=1, and T=0 is not
+       available over contactless. Declare the quirk so OpenSC sends such APDUs without Le (needs an
+       OpenSC that supports SC_CARD_CAP_CASE4_SHORT_NO_LE; inert otherwise). Lets the card work on both
+       the contact and the contactless interface without forcing T=0. */
+    if card.type_ == SC_CARD_TYPE_ACOS5_EVO_V4 {
+        card.caps |= SC_CARD_CAP_CASE4_SHORT_NO_LE;
     }
     //println!("card.caps: {:X}\n", card.caps);
     /* max_send_size  IS  treated as a constant (won't change) after assignment here ! */

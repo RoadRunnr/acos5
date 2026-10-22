@@ -1,0 +1,189 @@
+diff --git a/src/libopensc/apdu.c b/src/libopensc/apdu.c
+index 5355e0d..809c52e 100644
+--- a/src/libopensc/apdu.c
++++ b/src/libopensc/apdu.c
+@@ -60,7 +60,10 @@ size_t sc_apdu_get_length(const sc_apdu_t *apdu, unsigned int proto)
+ 		ret += apdu->lc + (proto == SC_PROTO_T0 ? 1 : 3);
+ 		break;
+ 	case SC_APDU_CASE_4_SHORT:
+-		ret += apdu->lc + (proto != SC_PROTO_T0 ? 2 : 1);
++		/* a Le byte follows the data under T=1, but not under T=0, nor for a
++		 * card that rejects it (SC_APDU_FLAGS_CASE4_SHORT_NO_LE) */
++		ret += apdu->lc + ((proto != SC_PROTO_T0 &&
++			!(apdu->flags & SC_APDU_FLAGS_CASE4_SHORT_NO_LE)) ? 2 : 1);
+ 		break;
+ 	case SC_APDU_CASE_4_EXT:
+ 		ret += apdu->lc + (proto == SC_PROTO_T0 ? 1 : 5);
+@@ -141,8 +144,10 @@ int sc_apdu2bytes(sc_context_t *ctx, const sc_apdu_t *apdu,
+ 		*p++ = (u8)apdu->lc;
+ 		memcpy(p, apdu->data, apdu->lc);
+ 		p += apdu->lc;
+-		/* in case of T0 no Le byte is added */
+-		if (proto != SC_PROTO_T0)
++		/* no Le byte under T=0, nor for a card that rejects it under T=1
++		 * (SC_APDU_FLAGS_CASE4_SHORT_NO_LE); the card answers 61xx instead */
++		if (proto != SC_PROTO_T0 &&
++				!(apdu->flags & SC_APDU_FLAGS_CASE4_SHORT_NO_LE))
+ 			*p = (u8)apdu->le;
+ 		break;
+ 	case SC_APDU_CASE_4_EXT:
+@@ -549,6 +554,11 @@ int sc_transmit_apdu(sc_card_t *card, sc_apdu_t *apdu)
+ 	/* determine the APDU type if necessary, i.e. to use
+ 	 * short or extended APDUs  */
+ 	sc_detect_apdu_cse(card, apdu);
++	/* a card that rejects a short case 4 Le under T=1 wants such an APDU sent
++	 * without Le, as under T=0 (see SC_CARD_CAP_CASE4_SHORT_NO_LE) */
++	if ((card->caps & SC_CARD_CAP_CASE4_SHORT_NO_LE)
++			&& (apdu->cse & SC_APDU_SHORT_MASK) == SC_APDU_CASE_4_SHORT)
++		apdu->flags |= SC_APDU_FLAGS_CASE4_SHORT_NO_LE;
+ 	/* basic APDU consistency check */
+ 	r = sc_check_apdu(card, apdu);
+ 	if (r != SC_SUCCESS)
+diff --git a/src/libopensc/opensc.h b/src/libopensc/opensc.h
+index dfc297f..43ed87a 100644
+--- a/src/libopensc/opensc.h
++++ b/src/libopensc/opensc.h
+@@ -572,6 +572,10 @@ struct sc_reader_operations {
+ #define SC_CARD_CAP_WRAP_KEY			0x00000800
+ /* Card (or card driver) supports key unwrapping operations */
+ #define SC_CARD_CAP_UNWRAP_KEY			0x00001000
++/* Card rejects a short case 4 APDU that carries Le under T=1 (answers 67 00).
++ * Send such APDUs without Le, as under T=0, and let GET RESPONSE read the data.
++ * Lets a card with this quirk work over T=1 or contactless, where T=0 cannot be forced. */
++#define SC_CARD_CAP_CASE4_SHORT_NO_LE		0x00002000
+ 
+ typedef struct sc_card {
+ 	struct sc_context *ctx;
+diff --git a/src/libopensc/types.h b/src/libopensc/types.h
+index 304725a..5a43584 100644
+--- a/src/libopensc/types.h
++++ b/src/libopensc/types.h
+@@ -314,6 +314,10 @@ typedef struct sc_file {
+ #define SC_APDU_FLAGS_NO_SM		0x00000008UL
+ /* let SM do the command chaining  */
+ #define SC_APDU_FLAGS_SM_CHAINING	0x00000010UL
++/* encode a short case 4 APDU without the Le byte, as under T=0, whatever the
++ * protocol; the card answers 61xx and GET RESPONSE reads the data. Set from
++ * SC_CARD_CAP_CASE4_SHORT_NO_LE for cards that reject a case 4 Le under T=1. */
++#define SC_APDU_FLAGS_CASE4_SHORT_NO_LE	0x00000020UL
+ 
+ #define SC_APDU_ALLOCATE_FLAG		0x01
+ #define SC_APDU_ALLOCATE_FLAG_DATA	0x02
+diff --git a/src/tests/unittests/Makefile.am b/src/tests/unittests/Makefile.am
+index 96ace28..b2ff53e 100644
+--- a/src/tests/unittests/Makefile.am
++++ b/src/tests/unittests/Makefile.am
+@@ -14,10 +14,10 @@ VALGRIND_FLAGS = --num-callers=30 -q --keep-debuginfo=yes --gen-suppressions=all
+ TESTS_ENVIRONMENT = LD_PRELOAD='$(PCSCLITE_PATH)'
+ endif
+ 
+-noinst_PROGRAMS = asn1 simpletlv cachedir pkcs15filter openpgp-tool hextobin \
++noinst_PROGRAMS = asn1 simpletlv cachedir pkcs15filter openpgp-tool hextobin apdu \
+ 	decode_ecdsa_signature check_macro_reference_loop strip_pkcs1_2_padding \
+ 	base64 parse_pkcs11_uri
+-TESTS = asn1 simpletlv cachedir pkcs15filter openpgp-tool hextobin \
++TESTS = asn1 simpletlv cachedir pkcs15filter openpgp-tool hextobin apdu \
+ 	decode_ecdsa_signature check_macro_reference_loop strip_pkcs1_2_padding \
+ 	base64 parse_pkcs11_uri
+ 
+@@ -41,6 +41,7 @@ cachedir_SOURCES = cachedir.c
+ pkcs15filter_SOURCES = pkcs15-emulator-filter.c
+ openpgp_tool_SOURCES = openpgp-tool.c $(top_builddir)/src/tools/openpgp-tool-helpers.c
+ hextobin_SOURCES = hextobin.c
++apdu_SOURCES = apdu.c
+ decode_ecdsa_signature_SOURCES = decode_ecdsa_signature.c
+ check_macro_reference_loop_SOURCES = check_macro_reference_loop.c
+ strip_pkcs1_2_padding_SOURCES = strip_pkcs1_2_padding.c
+diff --git a/src/tests/unittests/apdu.c b/src/tests/unittests/apdu.c
+new file mode 100644
+index 0000000..e897e53
+--- /dev/null
++++ b/src/tests/unittests/apdu.c
+@@ -0,0 +1,87 @@
++/*
++ * apdu.c: Unit tests for APDU encoding
++ *
++ * Copyright (C) 2026 Andreas Schultz <aschultz@warp10.net>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
++ */
++
++#include <stdio.h>
++#include <string.h>
++#include "libopensc/opensc.h"
++
++/* encode `apdu` for `proto` and compare the bytes with `exp` (`explen` long) */
++static int check(const char *name, sc_apdu_t *apdu, unsigned int proto,
++		const unsigned char *exp, size_t explen)
++{
++	unsigned char buf[64];
++	size_t len = sc_apdu_get_length(apdu, proto);
++	int r = sc_apdu2bytes(NULL, apdu, proto, buf, sizeof buf);
++
++	if (r != SC_SUCCESS) {
++		printf("FAIL %s: sc_apdu2bytes returned %d\n", name, r);
++		return 1;
++	}
++	if (len != explen || memcmp(buf, exp, explen) != 0) {
++		printf("FAIL %s: got %zu bytes, expected %zu\n", name, len, explen);
++		return 1;
++	}
++	printf("ok   %s\n", name);
++	return 0;
++}
++
++int main(void)
++{
++	int fail = 0;
++	unsigned char data[2] = { 0x3F, 0x00 };
++	/* SELECT 3F00 with response expected: a short case 4 APDU */
++	sc_apdu_t apdu;
++
++	memset(&apdu, 0, sizeof apdu);
++	apdu.cse = SC_APDU_CASE_4_SHORT;
++	apdu.ins = 0xA4;
++	apdu.lc = 2;
++	apdu.data = data;
++	apdu.datalen = 2;
++	apdu.le = 256;
++
++	/* T=0: the Le byte is never appended */
++	{
++		const unsigned char exp[] = { 0x00, 0xA4, 0x00, 0x00, 0x02, 0x3F, 0x00 };
++		fail += check("case 4 short, T=0", &apdu, SC_PROTO_T0, exp, sizeof exp);
++	}
++	/* T=1: the Le byte follows the data (le 256 -> 0x00) */
++	{
++		const unsigned char exp[] = { 0x00, 0xA4, 0x00, 0x00, 0x02, 0x3F, 0x00, 0x00 };
++		fail += check("case 4 short, T=1", &apdu, SC_PROTO_T1, exp, sizeof exp);
++	}
++	/* T=1 with SC_APDU_FLAGS_CASE4_SHORT_NO_LE: no Le byte, as under T=0 */
++	{
++		const unsigned char exp[] = { 0x00, 0xA4, 0x00, 0x00, 0x02, 0x3F, 0x00 };
++		apdu.flags |= SC_APDU_FLAGS_CASE4_SHORT_NO_LE;
++		fail += check("case 4 short, T=1 + NO_LE flag", &apdu, SC_PROTO_T1, exp, sizeof exp);
++		apdu.flags &= ~SC_APDU_FLAGS_CASE4_SHORT_NO_LE;
++	}
++
++	/* the flag must not change a case 3 APDU (no Le in the first place) */
++	{
++		const unsigned char exp[] = { 0x00, 0xA4, 0x00, 0x00, 0x02, 0x3F, 0x00 };
++		apdu.cse = SC_APDU_CASE_3_SHORT;
++		apdu.flags |= SC_APDU_FLAGS_CASE4_SHORT_NO_LE;
++		fail += check("case 3 short, flag ignored", &apdu, SC_PROTO_T1, exp, sizeof exp);
++	}
++
++	return fail ? 1 : 0;
++}

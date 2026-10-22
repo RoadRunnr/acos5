@@ -32,7 +32,7 @@ sudo apt install python3-pyscard python3-cryptography
 The paths on this page are for x86_64. On other architectures, Debian and Ubuntu use another directory instead of `x86_64-linux-gnu`, for example `aarch64-linux-gnu`.
 
 > [!IMPORTANT]
-> On the ACOS5-EVO, EC keys need an OpenSC fix that is not yet in a release: [OpenSC pull request #3884](https://github.com/OpenSC/OpenSC/pull/3884). Without it, PKCS#11 shows EC keys without their curve and applications cannot use them. RSA keys work without the fix.
+> On the ACOS5-EVO, two small OpenSC source patches are not yet in a release. Apply them to the OpenSC source before building it; see [opensc-patches](../opensc-patches/README.md). `pkcs15-ec-read_public_key-spki.patch` ([OpenSC#3884](https://github.com/OpenSC/OpenSC/pull/3884)) is needed for EC keys, or PKCS#11 shows them without their curve and applications cannot use them; RSA keys work without it. `apdu-case4-short-no-le.patch` lets the card work without forcing T=0 and enables the contactless interface; without it, force T=0 for the contact interface as the configuration reference describes.
 
 ## Build the driver
 

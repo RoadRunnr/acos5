@@ -41,11 +41,14 @@ For EC keys, OpenSC needs the fix from [OpenSC pull request #3884](https://githu
 
 The ACOS5-EVO starts with protocol T=1. A command that sends data and expects data back is an ISO/IEC 7816-4 case 4 command. Under T=1, the card rejects every case 4 command that carries the expected-length byte (Le). It answers status `67 00`. This affects, for example, SELECT with file control information, secure messaging, and signing. The card accepts these commands only without Le. It then answers `61 XX`, and the response data follows with GET RESPONSE.
 
-ISO/IEC 7816-3:2006, clause 12.3.5, says that under T=1 the command goes to the card unchanged, Le included. OpenSC follows the standard. Under T=0 (clause 12.2.5) the reader drops Le, and the card works as the standard says. So configure OpenSC to use T=0 for the ACOS5-EVO. See [Configuration reference](configuration.md#the-card_atr-block-for-the-acos5-evo).
+ISO/IEC 7816-3:2006, clause 12.3.5, says that under T=1 the command goes to the card unchanged, Le included. OpenSC follows the standard. Under T=0 (clause 12.2.5) the reader drops Le, and the card works as the standard says.
+
+There are two ways to handle this:
+
+- With `apdu-case4-short-no-le.patch` (see [opensc-patches](../../opensc-patches/README.md)), OpenSC sends a short case 4 command without Le for a card that sets the capability `SC_CARD_CAP_CASE4_SHORT_NO_LE`, which the driver does for the ACOS5-EVO. The card then works on either protocol, so this also enables the contactless interface, where T=0 cannot be negotiated. This is the recommended way.
+- Without the patch, configure OpenSC to use T=0 for the ACOS5-EVO with a `card_atr` block in `opensc.conf`. See [Configuration reference](configuration.md#the-card_atr-block-for-the-acos5-evo). This works on the contact interface only.
 
 Under T=0 the driver uses no extended commands. It sends long data, for example for RSA-4096 decryption, in several chained commands, and it reads long responses with GET RESPONSE.
-
-The file `diff_apdu_c.txt` patches OpenSC for T=1 instead. That patch is not recommended: it changes the handling of case 4 commands for all cards, not only for the ACOS5-EVO.
 
 > [!NOTE]
 > A CryptoMate EVO USB token sometimes stopped working in tests. See [Troubleshooting](../troubleshooting.md#a-cryptomate-evo-stops-working).

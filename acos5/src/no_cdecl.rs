@@ -86,7 +86,7 @@ use crate::constants_types::{ATR_MASK, ATR_V2, ATR_V3, BLOCKCIPHER_PAD_TYPE_ANSI
                              SC_SEC_OPERATION_GENERATE_RSAPRIVATE, SC_SEC_OPERATION_GENERATE_RSAPUBLIC,
                              Acos5EcCurve, build_apdu, is_DFMF, ATR_MASK_TCK, // p_void,
                              // ISO7816_RFU_TAG_FCP_SFI, ISO7816_RFU_TAG_FCP_SAC, ISO7816_RFU_TAG_FCP_SEID, ISO7816_RFU_TAG_FCP_SAE,
-                             GuardFile, SC_CARD_TYPE_ACOS5_EVO_V4, NAME_V4, ATR_V4_1, ATR_V4_2, ATR_V4_3, //, ATR_V4
+                             GuardFile, SC_CARD_TYPE_ACOS5_EVO_V4, NAME_V4, ATR_V4_1, ATR_V4_2, ATR_V4_3, ATR_V4_3_CL, ATR_MASK_TCK_CL, //, ATR_V4
                              file_id_from_path_value, file_id_se,
                              CRT_TAG_HT, CRT_TAG_CCT, CRT_TAG_DST, CRT_TAG_CT,
                              SC_SEC_OPERATION_GENERATE_ECCPRIVATE, SC_SEC_OPERATION_GENERATE_ECCPUBLIC,
@@ -1233,7 +1233,7 @@ pub(crate) fn pin_get_policy(card: &mut sc_card, ctx: &mut sc_context, data: &mu
 }
 
 #[must_use]
-pub(crate) fn acos5_supported_atrs() -> [sc_atr_table; 6]
+pub(crate) fn acos5_supported_atrs() -> [sc_atr_table; 7]
 {
     [
         sc_atr_table {
@@ -1281,6 +1281,14 @@ pub(crate) fn acos5_supported_atrs() -> [sc_atr_table; 6]
         sc_atr_table {
             atr:     ATR_V4_3.as_ptr(),
             atrmask: ATR_MASK_TCK.as_ptr(),
+            name:    NAME_V4.as_ptr(),
+            type_: SC_CARD_TYPE_ACOS5_EVO_V4,
+            flags: 0,
+            card_atr: null_mut(),
+        },
+        sc_atr_table { // dual-interface ACOS5-EVO over contactless (ISO 14443-4 pseudo-ATR)
+            atr:     ATR_V4_3_CL.as_ptr(),
+            atrmask: ATR_MASK_TCK_CL.as_ptr(),
             name:    NAME_V4.as_ptr(),
             type_: SC_CARD_TYPE_ACOS5_EVO_V4,
             flags: 0,
