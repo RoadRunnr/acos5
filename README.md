@@ -1,5 +1,8 @@
 # acos5
 
+> [!IMPORTANT]
+> This is a fork of [carblue/acos5](https://github.com/carblue/acos5) with many changes, most of them for the ACOS5-EVO. It is tested on ACOS5-EVO cards. The on-card file layout and the configuration are not guaranteed to stay stable for now. A pull request to send these changes upstream is in progress.
+
 acos5 is an open-source driver for the ACOS5 smart cards and USB tokens from Advanced Card Systems (ACS). It plugs into [OpenSC](https://github.com/OpenSC/OpenSC/wiki) as an external module. Through OpenSC's PKCS#11 module, applications such as OpenSSH, OpenSSL, Firefox, and Thunderbird can then use keys on the card.
 
 ACS offers no open-source PKCS#11 library for these cards, and OpenSC 0.27.1 has no driver for them.
