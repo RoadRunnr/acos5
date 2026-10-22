@@ -96,10 +96,13 @@ def piece3_app_df(user_pin: bytes, user_puk: bytes, key1: bytes | None, key2: by
     steps.append((activate("4101"), "activate 4101"))
 
     # Local symmetric key file 4102: internal linear variable (FDB 0C), max record 0x26, 12 records.
-    # Never readable; update needs the user PIN (SE #1), as in carblue.
+    # Never readable; update needs the user PIN (SE #1), as in carblue. Write never: for a key file the card
+    # checks the write SCB for PSO with a stored key (MSE CT + PSO ENCIPHER / DECIPHER). With the user PIN
+    # there, the SM keys would encrypt and decrypt any data, so whoever can send commands after a login
+    # could forge SM MACs and decrypt SM data. Secure messaging itself does not check this SCB.
     #   record 1 = key 0x81: AES-192 host authentication key (mutual authentication)
     #   record 2 = key 0x82: AES-192 secure messaging key
-    steps.append((create_file(fcp("4102", "82 06 0C 00 00 26 00 0C", "03 FF 03 03 01 01 FF")),
+    steps.append((create_file(fcp("4102", "82 06 0C 00 00 26 00 0C", "03 FF 03 03 FF 01 FF")),
                   "create local key file 4102"))
     steps.append((select("4102"), "select 4102"))
     if sm:

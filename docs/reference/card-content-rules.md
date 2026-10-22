@@ -49,7 +49,7 @@ The following table shows the file system that `tools/evo_init.py` creates:
 | EF.DIR | `3F00/2F00` | One application with the AID `ACOSPKCS-15v1.00` and the path `3F00/4100` |
 | Application directory | `3F00/4100` | The PKCS#15 application. Its SE file is `4103`. |
 | Local PIN file | `4100/4101` | The user PIN and user PUK, reference `81` |
-| Local symmetric key file | `4100/4102` | With `--sm`: key `81` (host authentication) and key `82` (secure messaging), both AES-192 |
+| Local symmetric key file | `4100/4102` | With `--sm`: key `81` (host authentication) and key `82` (secure messaging), both AES-192. The keys are never readable and never usable for encryption or decryption commands. |
 | Local SE file | `4100/4103` | SE records 1 to 6, described in the next table |
 | Secure messaging test files | `4100/4104`, `4100/4105` | With `--sm`: 16-byte files that need secure messaging to read |
 | PKCS#15 directory files | `4100/4110` to `4100/4118` | PrKDF, PuKDF, PuKDF trusted, SKDF, CDF, CDF trusted, CDF useful, DODF, AODF |
