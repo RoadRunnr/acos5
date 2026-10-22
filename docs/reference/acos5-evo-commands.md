@@ -203,6 +203,7 @@ The security condition bytes (SCBs) in `8C 08 7F` follow the access mode byte, f
 
 - DF: delete self, terminate, activate, deactivate, create DF, create EF, delete child
 - EF: delete self, terminate, activate, deactivate, write, update, read. Not verified (N): the fifth position is unused on a working EF.
+- Symmetric key EF (FDB `0C`), the EF order: the write position governs PSO ENCIPHER and DECIPHER with its keys, and the update position governs PUT KEY (V). Secure messaging with the keys checks neither. With write set to never, the keys work for secure messaging only.
 - Key EF: delete self, terminate, activate, deactivate, MSE / PSO, put key, get key. The driver calls the fifth position CRYPTO. Verified (V): the fifth position governs PSO SIGN and PSO DECIPHER. Not verified (N): GENERATE KEY PAIR checks the put key condition of both key EFs.
 - SE EF (N): delete self, terminate, activate, deactivate, MSE restore, MSE store / erase, read
 
@@ -558,7 +559,7 @@ No MSE is needed, unlike for GENERATE KEY PAIR. The key EF's own update conditio
 
 SM form (V): `8C DA` with the record in an encrypted `87` object. It works on key EFs whose update SCB requires SM: the public record returns `63 01`, then the private record `90 00`. On a key EF without SM in its update SCB, the card refuses it with `69 87`. With CLA `0C DA` the card answers `6D 00`.
 
-Not verified (N): the symmetric form, also for GET KEY, has P1 `01` and P2 = record number in the symmetric key EF.
+The symmetric form `80 DA 01 <record> Lc <record data>` writes a whole record into a symmetric key EF, also while the EF is active (V). UPDATE RECORD and APPEND RECORD are refused there with `69 82` once the EF is active. Not verified (N): the symmetric form of GET KEY, with P1 `01` and P2 = record number.
 
 `90 00` means success. `63 01` also counts as success, but it means the card could not confirm its pairwise consistency test: the matching counterpart key is missing or does not match. When the public and the private EF of a pair are both written and agree, the second write returns `90 00`. Write the public EF first, so that the private record's pairwise test passes.
 
@@ -659,6 +660,11 @@ The card encrypts and decrypts with a stored DES, 3DES-112, 3DES-168, or AES-192
 - The response is `61 XX`, and GET RESPONSE returns the result.
 
 P1 P2 `86 80` gets `6A 86`. The algorithm codes `04` and `06` of the older card are refused at MSE with `6A 80`.
+
+The write condition of the key EF applies (V). The card uses only the first symmetric key EF of a DF (V): a key that lives only in a second symmetric key EF of the same DF is never usable here. It answers `6A 88` when the first key EF is free, and `69 82`, the first EF's write condition, when that EF is locked.
+
+> [!IMPORTANT]
+> These commands work with the secure messaging keys too, if the write condition of their key EF allows it. Anyone who can send commands then can compute MACs and decrypt data under the secure messaging key. `tools/evo_init.py` sets the write condition of `4100/4102` to never.
 
 Not verified (N): the data has `08` to `F8` bytes, a multiple of the block size, and longer data takes CLA `10` on all blocks but the last.
 
