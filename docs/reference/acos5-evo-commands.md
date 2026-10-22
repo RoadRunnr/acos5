@@ -91,8 +91,8 @@ The following table lists the known commands:
 | `00 46` | GENERATE KEY PAIR (RSA / EC) | D |
 | `00 2A 9E 9A` | PSO COMPUTE DIGITAL SIGNATURE | D |
 | `00 2A 80 84` | PSO DECIPHER (RSA private key) | D |
-| `00 2A 80 84` (symmetric) | PSO DECIPHER with a symmetric key | U |
-| `00 2A 84 80` | PSO ENCIPHER | V |
+| `00 2A 80 84` (symmetric) | PSO DECIPHER with a symmetric key | V |
+| `00 2A 84 80` | PSO ENCIPHER (RSA public key, symmetric key) | V |
 | `00 2A 00 A8` | PSO VERIFY DIGITAL SIGNATURE | N |
 | `00 2A 90 80` | PSO HASH | V |
 | `00 2A 8E 80` | PSO COMPUTE CRYPTOGRAPHIC CHECKSUM | V |
@@ -451,9 +451,9 @@ The following table lists the algorithm references:
 | DST `B6` | `21` | RSA verify (PSO VERIFY DIGITAL SIGNATURE) | N |
 | DST `B6` | `41` | ECDSA verify (PSO VERIFY DIGITAL SIGNATURE) | N |
 | CT `B8` | `24` | RSA decipher / encipher | D |
-| CT `B8` | `10` / `11` | DES ECB / CBC | U |
-| CT `B8` | `12` / `13` | 3DES ECB / CBC (`13` verified in an SM CT with a static 3DES key and with the session key) | U / V |
-| CT `B8` | `14` / `15` | AES ECB / CBC (`15` verified in an SM CT) | U / V |
+| CT `B8` | `10` / `11` | DES ECB / CBC | V |
+| CT `B8` | `12` / `13` | 3DES ECB / CBC, 2-key and 3-key (`13` also in an SM CT with a static 3DES key and with the session key) | V |
+| CT `B8` | `14` / `15` | AES ECB / CBC (`15` also in an SM CT) | V |
 | CCT `B4` | `1D` | AES CMAC (verified in an SM CCT) | V |
 | CCT `B4` | `13` | 3DES MAC (verified in an SM CCT with a static 3DES key) | V |
 | CCT `B4` | `11` | DES MAC (refused with `69 88` for a 3DES key) | U |
@@ -466,7 +466,7 @@ The following details are not verified (N):
 - MSE uses only P1 `01` with the tags `B6` (DST), `B8` (CT), and `AA` (HT). AT `A4` and CCT `B4` appear only in SE records. No MSE with a KAT `A6` is known.
 - The data objects in an MSE are only `80`, `81`, `83`, `87`, and `95`.
 - The usage byte for sign, verify, and decipher can be `95 01 C0` instead of `40`. Verified (V) for EC signing: a DST with `95 01 C0` gives the same valid signature as with `40`.
-- A symmetric CT has the form `B8 L 80 01 <algo> 87 L <IV> 83 01 <keyref> 95 01 <usage>`, where `<keyref>` is the key reference without the local bit `80` (key `81` is written as `01`).
+- A symmetric CT has the form `B8 L 80 01 <algo> [87 L <IV>] 83 01 <keyref> 95 01 C0` (V). `<keyref>` is the key ID with the local bit, for example `83` for the local key 3. Without the local bit, the card answers `6A 88`.
 - No CT is known for EC keys.
 
 ## Internal file record formats (V)
@@ -487,7 +487,7 @@ Symmetric key EF (FDB `0C`), one record per key:
 
 ```text
 <80|id> 03 FF FF <error counter> <algo> <key bytes>
-   algo 22 / 24 / 28 = AES-128 / -192 / -256, 14 = 3DES-168
+   algo 22 / 24 / 28 = AES-128 / -192 / -256, 11 = DES, 12 = 3DES-112, 14 = 3DES-168
 ```
 
 The first byte has bit 7 set (valid) and the key ID in the low 5 bits. A 3DES-168 record `<80|id> 03 FF FF 88 14 <24-byte key>` works for external and internal authentication (V).
@@ -639,13 +639,26 @@ Verified (V) for all five HT algorithms, SHA-224 included: the response is `61 X
 
 Not verified (N): PSO COMPUTE DIGITAL SIGNATURE with Lc `00` (`00 2A 9E 9A 00`) signs the hash of the preceding PSO HASH.
 
-### PSO COMPUTE CRYPTOGRAPHIC CHECKSUM `00 2A 8E 80 Lc data` (N)
+### PSO COMPUTE CRYPTOGRAPHIC CHECKSUM `00 2A 8E 80 Lc data` (V)
 
 Computes a MAC over the data with the key and algorithm of the CCT set by MSE. The response is `61 XX`, and GET RESPONSE returns the checksum.
 
 Verified (V) with AES-CMAC: the MSE is `00 22 01 B4 08 80 01 1D 83 01 <key> 95 01 40`, and the PSO data is `80 L <data>`. The response is the full 16-byte AES-CMAC over the whole `80 L <data>` field, not truncated. With `84 00` instead of `83 01 <key>` in the CCT, the card computes the checksum under the session key, without secure messaging on the command.
 
-A CT for a symmetric PSO ENCIPHER is not available: the MSE is accepted, but PSO ENCIPHER `00 2A 86 80` and `00 2A 84 80` return `6A 86`. The algorithm codes `04` and `06` of the older card are refused at MSE with `6A 80`.
+### Symmetric PSO ENCIPHER `00 2A 84 80` and PSO DECIPHER `00 2A 80 84` (V)
+
+The card encrypts and decrypts with a stored DES, 3DES-112, 3DES-168, or AES-192 key, in ECB and CBC. The results match a software implementation. The MSE sets a CT:
+
+```text
+00 22 01 B8 L 80 01 <algo> [87 L <IV>] 83 01 <keyref> 95 01 C0
+```
+
+- `<algo>` comes from the CT rows of the algorithm table: `10`/`11` DES, `12`/`13` 3DES, `14`/`15` AES (ECB/CBC).
+- CBC takes the IV in `87`: 8 bytes for DES and 3DES, 16 bytes for AES. ECB has no `87`.
+- `<keyref>` is the key ID with the local bit. Without it, the card answers `6A 88`.
+- The response is `61 XX`, and GET RESPONSE returns the result.
+
+P1 P2 `86 80` gets `6A 86`. The algorithm codes `04` and `06` of the older card are refused at MSE with `6A 80`.
 
 Not verified (N): the data has `08` to `F8` bytes, a multiple of the block size, and longer data takes CLA `10` on all blocks but the last.
 
