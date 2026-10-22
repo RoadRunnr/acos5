@@ -283,6 +283,8 @@ Unblocks the PIN with its resetting code (PUK) and sets the new PIN.
 
 SM form (V): `0C 2C`, with the PUK and the new PIN in an encrypted `87` object. Works where the DF requires SM for INS `2C`. Refused with `69 87` where it does not.
 
+Tested with a PUK that differs from its PIN, for the user PIN under SM and for the SO PIN in plain (V). The card checks the PUK, not the PIN. The PIN given as the PUK is refused, and only the PUK's retry counter drops by one. A PIN blocked by eight wrong VERIFY commands is unblocked with the right PUK.
+
 ### ENABLE and DISABLE PIN VERIFICATION `00 28 P1 ref` / `00 26 P1 ref` (N)
 
 P1 `00`: the data is the current PIN. P1 `01`: no data, and the PIN must be verified first. A disabled PIN need not be presented for the access rights tied to it, and VERIFY on it answers `69 84`.
@@ -478,6 +480,8 @@ C1 <tries> <len> PIN... <tries> <len> PUK...
    C1     = valid | resetting code present | PIN ID 1
    tries  = high nibble maximum retries, low nibble retries left (for example 88)
 ```
+
+The PIN and the PUK each have their own retry counter (V).
 
 Symmetric key EF (FDB `0C`), one record per key:
 
