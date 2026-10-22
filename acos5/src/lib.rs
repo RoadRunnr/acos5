@@ -398,7 +398,8 @@ use opensc_sys::opensc::{sc_card, sc_card_driver, sc_card_operations, sc_securit
                          SC_READER_SHORT_APDU_MAX_RECV_SIZE, SC_ALGORITHM_RSA, SC_ALGORITHM_ONBOARD_KEY_GEN,
                          SC_ALGORITHM_RSA_RAW, SC_SEC_OPERATION_SIGN, SC_SEC_OPERATION_DECIPHER,
                          SC_SEC_ENV_FILE_REF_PRESENT, SC_SEC_OPERATION_DERIVE, SC_PIN_CMD_GET_INFO,
-                         SC_PIN_CMD_VERIFY, SC_PIN_CMD_CHANGE, SC_PIN_CMD_UNBLOCK, SC_ALGORITHM_RSA_PAD_PKCS1,
+                         SC_PIN_CMD_VERIFY, SC_PIN_CMD_CHANGE, SC_PIN_CMD_UNBLOCK, SC_PIN_CMD_USE_PINPAD,
+                         SC_ALGORITHM_RSA_PAD_PKCS1,
                          SC_ALGORITHM_RSA_PAD_ISO9796, SC_SEC_ENV_ALG_REF_PRESENT, SC_SEC_ENV_ALG_PRESENT,
                          SC_ALGORITHM_3DES, SC_ALGORITHM_DES, SC_RECORD_BY_REC_NR, SC_CARD_CAP_ISO7816_PIN_INFO,
                          SC_ALGORITHM_AES, SC_ALGORITHM_EXT_EC_NAMEDCURVE, SC_CARD_CAP_APDU_EXT, SC_ALGORITHM_EC,
@@ -2837,6 +2838,12 @@ fn evo_pin_cmd(card: &mut sc_card, ctx: &mut sc_context, pin_cmd_data: &mut sc_p
             Ok(unsafe { func_ptr(card, pin_cmd_data, tries_left_ptr) })
         },
         _ if SC_AC_CHV != pin_cmd_data.pin_type => Err(log3ifr_ret!(ctx,f,line!(), SC_ERROR_INVALID_ARGUMENTS)),
+        // The PIN needs secure messaging. The driver wraps it on the host, so a PIN pad cannot
+        // supply it: the reader has neither the SM keys nor the SSC. Refuse rather than send an
+        // empty PIN. This is the --bind user PIN; use a non-bound card for PIN pad entry.
+        _ if (pin_cmd_data.flags & SC_PIN_CMD_USE_PINPAD) != 0 =>
+            Err(log3ifr_ret!(ctx,f,line!(), c"PIN pad entry is not possible for a PIN that requires secure messaging",
+                SC_ERROR_NOT_SUPPORTED)),
         sm_use @ (SmUse::Mac | SmUse::MacEnc) => {
             card.sm_ctx.info.cmd = SM_CMD_PIN;
             evo_sm_pin_cmd(card, pin_cmd_data, tries_left, sm_use == SmUse::MacEnc)
@@ -2923,7 +2930,12 @@ fn acos5_pin_cmd(card: &mut sc_card, ctx: &mut sc_context, data_ptr: *mut sc_pin
         //log3if!(ctx,f,line!(), c"pin_cmd_data.pin_type:  %u", pin_cmd_data.pin_type);
         //log3if!(ctx,f,line!(), c"pin_cmd_data.pin1.len:  %lu", pin_cmd_data.pin1.len);
         //log3if!(ctx,f,line!(), c"pin_cmd_data.pin1.data: %p", pin_cmd_data.pin1.data);
-        if SC_AC_CHV != pin_cmd_data.pin_type || pin_cmd_data.pin1.len == 0 || pin_cmd_data.pin1.data.is_null() {
+        // A pinpad VERIFY carries no PIN bytes (the reader supplies them), so only require them
+        // when the PIN pad is not in use. evo_pin_cmd routes a plain VERIFY to iso7816_pin_cmd,
+        // which performs the pinpad transaction; a bound (SM) PIN stays host-only (see evo_pin_cmd).
+        let use_pinpad = (pin_cmd_data.flags & SC_PIN_CMD_USE_PINPAD) != 0;
+        if SC_AC_CHV != pin_cmd_data.pin_type
+            || (!use_pinpad && (pin_cmd_data.pin1.len == 0 || pin_cmd_data.pin1.data.is_null())) {
             //log3if!(ctx,f,line!(), c"returning from here with SC_ERROR_INVALID_ARGUMENTS!");
             return Err(SC_ERROR_INVALID_ARGUMENTS);
         }
@@ -3053,10 +3065,14 @@ println!();
     }
 
     else if SC_PIN_CMD_CHANGE   == pin_cmd_data.cmd { // pin1 is old pin, pin2 is new pin
-        if pin_cmd_data.pin1.len == 0 || pin_cmd_data.pin1.data.is_null() ||
+        // With the PIN pad the reader supplies both PINs, so pin1/pin2 carry no bytes; require them
+        // only without the pad. evo_pin_cmd routes a plain change to iso7816_pin_cmd, which runs the
+        // reader's modify path (pcsc_pin_cmd handles SC_PIN_CMD_CHANGE).
+        if (pin_cmd_data.flags & SC_PIN_CMD_USE_PINPAD) == 0 &&
+          (pin_cmd_data.pin1.len == 0 || pin_cmd_data.pin1.data.is_null() ||
            pin_cmd_data.pin2.len == 0 || pin_cmd_data.pin2.data.is_null() ||
            pin_cmd_data.pin1.len != pin_cmd_data.pin2.len ||
-           pin_cmd_data.pin1.len  > 8 {
+           pin_cmd_data.pin1.len  > 8) {
             return Err(SC_ERROR_INVALID_ARGUMENTS);
         }
 
@@ -3100,10 +3116,13 @@ println!();
     }
 
     else if SC_PIN_CMD_UNBLOCK  == pin_cmd_data.cmd { // pin1 is PUK, pin2 is new pin for the one blocked
-        if  pin_cmd_data.pin1.len == 0 || pin_cmd_data.pin1.data.is_null() ||
+        // With the PIN pad the reader supplies the PUK and the new PIN, so require them only without
+        // the pad (pcsc_pin_cmd handles SC_PIN_CMD_UNBLOCK on the reader's modify path).
+        if (pin_cmd_data.flags & SC_PIN_CMD_USE_PINPAD) == 0 &&
+           (pin_cmd_data.pin1.len == 0 || pin_cmd_data.pin1.data.is_null() ||
             pin_cmd_data.pin2.len == 0 || pin_cmd_data.pin2.data.is_null() ||
             pin_cmd_data.pin1.len != pin_cmd_data.pin2.len ||
-            pin_cmd_data.pin1.len  > 8 {
+            pin_cmd_data.pin1.len  > 8) {
             return Err(SC_ERROR_INVALID_ARGUMENTS);
         }
 
