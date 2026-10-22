@@ -69,10 +69,10 @@ The following table lists the known commands:
 | `00 C0` | GET RESPONSE | V |
 | `00 B0` / `0C B0` | READ BINARY (plain / SM) | V |
 | `00 D6` / `0C D6` | UPDATE BINARY (plain / SM) | V |
-| `00 0E` | ERASE BINARY | U |
+| `00 0E` | ERASE BINARY | V |
 | `00 B2` | READ RECORD | V |
 | `00 DC` | UPDATE RECORD | V |
-| `00 E2` | APPEND RECORD | U |
+| `00 E2` | APPEND RECORD | V |
 | `00 E0` | CREATE FILE | V |
 | `00 E4` | DELETE FILE | D |
 | `00 44` (P1 `00`) | ACTIVATE FILE | V |
@@ -81,8 +81,8 @@ The following table lists the known commands:
 | `00 24` / `0C 24` | CHANGE REFERENCE DATA (plain / SM) | D / V |
 | `00 2C` / `0C 2C` | RESET RETRY COUNTER (plain / SM) | V |
 | `00 28` / `00 26` | ENABLE / DISABLE PIN VERIFICATION | N |
-| `80 2E` | LOGOUT PIN | U |
-| `80 8A` | DE-AUTHENTICATE KEY | U |
+| `80 2E` | LOGOUT PIN | V |
+| `80 8A` | DE-AUTHENTICATE KEY | V |
 | `00 84` | GET CHALLENGE | V |
 | `00 82` | EXTERNAL / MUTUAL AUTHENTICATE | V |
 | `00 88` | INTERNAL AUTHENTICATE | V |
@@ -92,9 +92,9 @@ The following table lists the known commands:
 | `00 2A 9E 9A` | PSO COMPUTE DIGITAL SIGNATURE | D |
 | `00 2A 80 84` | PSO DECIPHER (RSA private key) | D |
 | `00 2A 80 84` (symmetric) | PSO DECIPHER with a symmetric key | U |
-| `00 2A 84 80` | PSO ENCIPHER | U |
+| `00 2A 84 80` | PSO ENCIPHER | V |
 | `00 2A 00 A8` | PSO VERIFY DIGITAL SIGNATURE | N |
-| `00 2A 90 80` | PSO HASH | N |
+| `00 2A 90 80` | PSO HASH | V |
 | `00 2A 8E 80` | PSO COMPUTE CRYPTOGRAPHIC CHECKSUM | V |
 | `00 2A 00 A2` | PSO VERIFY CRYPTOGRAPHIC CHECKSUM | N |
 | `00 2A 90 9E` | PSO RECOVER SIGNED DATA | N |
@@ -156,13 +156,13 @@ P1 P2 is the offset. Writes with P1 `C1` target the card header. `tools/safecard
 
 Not verified (N): P1 bit 7 set is the SFI form, as for READ BINARY. Without an MF, UPDATE BINARY writes physical memory. On the ACOS5-EVO that window exists between ZEROIZE and CREATE FILE of the MF. `tools/safecard.py` therefore refuses UPDATE BINARY with any CLA after a successful ZEROIZE until CREATE FILE of `3F00` succeeds, and at start until a SELECT succeeds. It also refuses the SFI form.
 
-### ERASE BINARY `00 0E P1 P2 [02 end]` (U)
+### ERASE BINARY `00 0E P1 P2 [02 end]` (V)
 
-P1 P2 is the start offset. The optional 2-byte data is the end offset (exclusive). Without data, the command erases to the end of the file.
+P1 P2 is the start offset. The optional 2-byte data is the end offset (exclusive). Without data, the command erases to the end of the file. Erased bytes read back as `00`.
 
 ### READ RECORD `00 B2 rec 04 Le` and UPDATE RECORD `00 DC rec 04 Lc data` (V)
 
-P2 `04` means the record number is in P1. The internal PIN, key, and SE files are record files (see [Internal file record formats](#internal-file-record-formats-v)). APPEND RECORD `00 E2 00 00 Lc data` (U) adds a record to a linear variable or cyclic file.
+P2 `04` means the record number is in P1. The internal PIN, key, and SE files are record files (see [Internal file record formats](#internal-file-record-formats-v)). APPEND RECORD `00 E2 00 00 Lc data` (V) adds a record to a linear variable file. Linear fixed and cyclic files refuse it with `69 81`.
 
 Not verified (N): the low 3 bits of P2 select the record: `0` first, `1` last, `2` next, `3` previous, `4` record number in P1 (1-based). The high 5 bits of P2, if not zero, are an SFI. On a cyclic EF, P1 `00` with P2 `04` reads the current record. Only P2 `04` is verified.
 
@@ -289,9 +289,9 @@ Tested with a PUK that differs from its PIN, for the user PIN under SM and for t
 
 P1 `00`: the data is the current PIN. P1 `01`: no data, and the PIN must be verified first. A disabled PIN need not be presented for the access rights tied to it, and VERIFY on it answers `69 84`.
 
-### LOGOUT PIN `80 2E 00 ref` and DE-AUTHENTICATE KEY `80 8A 00 ref` (U)
+### LOGOUT PIN `80 2E 00 ref` and DE-AUTHENTICATE KEY `80 8A 00 ref` (V)
 
-Clear the verified state of a PIN or a key.
+Clear the verified state of a PIN or a key. After LOGOUT PIN, a read that needs the PIN is refused with `69 82`, and VERIFY without data answers `63 CX`. After DE-AUTHENTICATE KEY, a read that needs an authentication with the key is refused again.
 
 ### GET CHALLENGE `00 84 00 00 Le` (V)
 
@@ -306,7 +306,7 @@ Details that are not verified (N):
 - Lc is twice the challenge length. The cipher is AES-ECB, one block each, with the algorithm of the key record (AES-192 for algorithm `24`). The card authenticates the host from the second half. The host authenticates the card by comparing the GET RESPONSE data with its own E(RNDh).
 - `69 83` means the key is blocked (error counter used up). `63 CX` means a wrong cryptogram with X tries left.
 - One command does both directions. No separate INTERNAL AUTHENTICATE step exists on this path.
-- An SE record can make the authenticated key an access condition: `A4 06 83 01 <key ID> 95 01 80` (usage `80` = key authenticated, `08` = PIN verified, `88` = both). The key ID is written without the local bit (key `81` as `01`). An SCB that points at such a record then requires a mutual authentication with that key.
+- An SE record can make the authenticated key an access condition: `A4 06 83 01 <key ID> 95 01 80` (usage `80` = key authenticated, `08` = PIN verified, `88` = both). The key ID is written with the local bit: `83 01 81` for the local key `81` (V). With `83 01 01`, an external authentication with key `81` does not meet the condition. An SCB that points at such a record then requires an authentication with that key. An external authentication with a 3DES key meets it (V).
 
 The functional specification (sections 5.5 and 5.6) says that mutual authentication uses two keys of the same algorithm and length, a card key KC and a terminal key KT. It also says the card generates a session key KS automatically after the procedure, for AES or 3DES. The card keeps KS internal, so the host must derive the same KS to use it.
 
@@ -457,7 +457,7 @@ The following table lists the algorithm references:
 | CCT `B4` | `1D` | AES CMAC (verified in an SM CCT) | V |
 | CCT `B4` | `13` | 3DES MAC (verified in an SM CCT with a static 3DES key) | V |
 | CCT `B4` | `11` | DES MAC (refused with `69 88` for a 3DES key) | U |
-| HT `AA` | `80` `81` `82` `84` `88` | SHA-1 / -224 / -256 / -384 / -512 | U |
+| HT `AA` | `80` `81` `82` `84` `88` | SHA-1 / -224 / -256 / -384 / -512 | V |
 
 Key generation sends two MSEs: a DST with `95 01 40` and the private key file ID, then a DST with `95 01 80` and the public key file ID. Signing uses a DST with algorithm `20` or `40` and `95 01 40`. RSA signing also sets a CT (algorithm `24`), so that DigestInfos other than SHA-1 and SHA-256 can go through decipher. ECDSA takes no CT: the card rejects it.
 
@@ -504,7 +504,7 @@ A4 06 83 01 <PIN ref> 95 01 08                       user verification (AT)
 A4 09 83 01 81 83 01 01 95 01 08                     two PINs (both only with SCB 8n, not tested)
 B4 09 83 01 <key> 95 01 30 80 01 1D                  SM MAC, AES-CMAC (CCT)
 B8 09 83 01 <key> 95 01 30 80 01 15                  SM encryption, AES-CBC (CT)
-A4 06 83 01 <key> 95 01 80                           key authenticated by MUTUAL AUTHENTICATE (N)
+A4 06 83 01 <key> 95 01 80                           key authenticated, key ID with the local bit (V)
 ```
 
 RSA and EC key EFs are written by GENERATE KEY PAIR or PUT KEY. Their content is readable only with GET KEY.
@@ -605,7 +605,7 @@ SM form: `0C 2A 9E 9A` with the hash in `81` (MAC only), after a plain MSE. On a
 
 ### PSO DECIPHER `00 2A 80 84 Lc cryptogram` (D)
 
-RSA private key decipher after an MSE CT with algorithm `24` and `95 01 40`. RSA-4096 sends its 512-byte input with command chaining. The response is the plaintext with the PKCS#1 v1.5 padding removed.
+RSA private key decipher after an MSE CT with algorithm `24` and `95 01 40`. RSA-4096 sends its 512-byte input with command chaining. The response is the full PKCS#1 v1.5 block (`00 02 .. 00 <message>`), and the driver removes the padding (V).
 
 SM form (V), on an RSA key EF whose crypto SCB requires SM:
 
@@ -613,7 +613,7 @@ SM form (V), on an RSA key EF whose crypto SCB requires SM:
 - CLA is `1C` on all blocks but the last, which has `0C`. The MAC header uses the CLA that is sent.
 - The first block of a two-block cryptogram gets `61 0A` with a `99 02 90 00` response.
 - The last block's response comes in two `87` objects (`87 FE 00 ..`, `87 04 00 ..`, padding indicator `00`, 256 bytes), with inner SW `61 00`.
-- The 256 bytes are the PKCS#1 v1.5 block (`00 02 .. 00 <message>`). Under SM the card does not remove the padding.
+- The 256 bytes are the PKCS#1 v1.5 block (`00 02 .. 00 <message>`), as in the plain form.
 
 The card refuses these other forms with `69 88` on the first block:
 
@@ -623,19 +623,21 @@ The card refuses these other forms with `69 88` on the first block:
 
 On key EFs without SM in their crypto SCB, the card refuses the SM form with `69 87`. RSA-4096 under SM sends its 512-byte cryptogram in three blocks (V).
 
-### PSO ENCIPHER `00 2A 84 80 Lc data` (U)
+### PSO ENCIPHER `00 2A 84 80 Lc data` (V)
 
-RSA public key encipher after an MSE CT with `95 01 80`.
+RSA public key operation after an MSE CT with algorithm `24`, the public key file ID, and `95 01 80`. The input is a block of the modulus length, padded by the host, for example with PKCS#1 v1.5 type 2. The card applies raw RSA and adds no padding, so the same input gives the same output. RSA-2048 sends its 256 bytes with command chaining. PSO DECIPHER with the private key returns the block.
 
 ### PSO VERIFY DIGITAL SIGNATURE `00 2A 00 A8 Lc data` (N)
 
 Verifies a signature. An MSE comes first. Success is `90 00`. Data longer than one block uses command chaining (CLA `10` on every block except the last). The layout of the data field is not known.
 
-### PSO HASH `00 2A 90 80 Lc data` (N)
+### PSO HASH `00 2A 90 80 Lc data` (V)
 
 Computes a hash on the card. The MSE that comes first sets a hash template: `00 22 01 AA 03 80 01 <algo>`, with the algorithm references from the HT row of the algorithm table. The response is `61 XX` (XX = hash length, read with GET RESPONSE) or `90 00`. Data longer than one block uses command chaining (CLA `10` on every block except the last). The HT algorithm references in use are `80`, `82`, `84`, and `88` (SHA-1, SHA-256, SHA-384, SHA-512).
 
-PSO COMPUTE DIGITAL SIGNATURE with Lc `00` (`00 2A 9E 9A 00`) signs the hash of the preceding PSO HASH.
+Verified (V) for all five HT algorithms, SHA-224 included: the response is `61 XX`, and the hash matches. The driver does not use PSO HASH.
+
+Not verified (N): PSO COMPUTE DIGITAL SIGNATURE with Lc `00` (`00 2A 9E 9A 00`) signs the hash of the preceding PSO HASH.
 
 ### PSO COMPUTE CRYPTOGRAPHIC CHECKSUM `00 2A 8E 80 Lc data` (N)
 
@@ -688,7 +690,7 @@ A command whose SCB is `4n` or `Cn` must be sent with the SM bits in CLA (`0C`, 
 5. The key is the static key from the SE record. The card uses no session keys here. The challenge is not part of the MAC, so commands with only a MAC can be replayed.
 6. The card accepts SM only where the access condition requires it. It refuses an SM command to a file or DF whose SCB or SAE does not require SM with `69 87`. A driver mode that sends SM for every command therefore fails on such files.
 
-READ BINARY and UPDATE BINARY are verified with MAC only and with MAC and encryption. The driver also wraps UPDATE RECORD, APPEND RECORD, and DELETE FILE (U).
+READ BINARY and UPDATE BINARY are verified with MAC only and with MAC and encryption. UPDATE RECORD, APPEND RECORD, and ERASE BINARY work under SM with a MAC (V). The card refuses DELETE FILE under SM with `69 87` (V). This holds with a MAC only and with a MAC and encryption, and with the file ID in the data or the file selected. A file whose delete condition requires SM can therefore be deleted only together with its DF. The driver also wraps UPDATE RECORD, APPEND RECORD, and DELETE FILE (U).
 
 Limits of the format:
 
@@ -696,7 +698,7 @@ Limits of the format:
 - Longer response data is split into several data objects (V: `87 FE` + `87 04` for a 256-byte result).
 - The padding indicator `00` means no padding, `01` means padded (V: the card sends `00` for 256 bytes).
 - The `99` object carries the SW of the plain command, for example `61 00` (V).
-- On the ACOS5-EVO, VERIFY, CHANGE REFERENCE DATA, and RESET RETRY COUNTER work under SM (V). The card refuses SM for EC GENERATE KEY PAIR with `69 87` (V). It accepts SM for ECDSA signing only where a DF SAE requires SM for INS `2A` (V). Not verified on the ACOS5-EVO (N): SM for CREATE FILE, ERASE BINARY, ACTIVATE and DEACTIVATE FILE, TERMINATE DF and EF, MSE, and READ RECORD.
+- On the ACOS5-EVO, VERIFY, CHANGE REFERENCE DATA, and RESET RETRY COUNTER work under SM (V). The card refuses SM for EC GENERATE KEY PAIR with `69 87` (V). It accepts SM for ECDSA signing only where a DF SAE requires SM for INS `2A` (V). It refuses SM for DELETE FILE with `69 87` (V). Not verified on the ACOS5-EVO (N): SM for CREATE FILE, ACTIVATE and DEACTIVATE FILE, TERMINATE DF and EF, MSE, and READ RECORD.
 
 ### Commands the driver sends under secure messaging
 
